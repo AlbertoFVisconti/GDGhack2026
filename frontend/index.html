@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>OAK Obstacle Navigator</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <section class="video-pane">
+        <div class="stream-wrap">
+          <img id="depthStream" src="/stream/depth.mjpg" alt="Depth stream with obstacle overlay" />
+          <div class="hud">
+            <span id="statusDot" class="dot"></span>
+            <span id="pipelineStatus">Starting</span>
+          </div>
+        </div>
+      </section>
+
+      <aside class="side-panel">
+        <section class="decision">
+          <p class="eyebrow">Guidance</p>
+          <h1 id="path">Waiting</h1>
+          <p id="reason">Waiting for point cloud data from the OAK.</p>
+        </section>
+
+        <section class="metric-grid">
+          <div>
+            <span>Obstacle</span>
+            <strong id="detected">--</strong>
+          </div>
+          <div>
+            <span>Nearest</span>
+            <strong id="nearest">--</strong>
+          </div>
+          <div>
+            <span>Confidence</span>
+            <strong id="confidence">--</strong>
+          </div>
+        </section>
+
+        <section class="lanes">
+          <div class="lane">
+            <span>Left</span>
+            <meter id="leftMeter" min="0" max="3500" value="0"></meter>
+            <strong id="leftValue">--</strong>
+          </div>
+          <div class="lane">
+            <span>Center</span>
+            <meter id="centerMeter" min="0" max="3500" value="0"></meter>
+            <strong id="centerValue">--</strong>
+          </div>
+          <div class="lane">
+            <span>Right</span>
+            <meter id="rightMeter" min="0" max="3500" value="0"></meter>
+            <strong id="rightValue">--</strong>
+          </div>
+        </section>
+
+        <section class="cloud-panel">
+          <div class="panel-title">
+            <span>Top-Down Point Cloud</span>
+            <span id="rangeLabel">3.5 m</span>
+          </div>
+          <canvas id="cloud" width="520" height="360"></canvas>
+        </section>
+      </aside>
+    </main>
+    <script src="/app.js"></script>
+  </body>
+</html>
