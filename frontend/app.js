@@ -71,6 +71,8 @@ function drawCloud(points, thresholds, path = "") {
   const maxRange = (thresholds?.max_range_mm || 3500) / 1000;
   const obstacle = (thresholds?.obstacle_mm || 1500) / 1000;
   const caution = (thresholds?.caution_mm || 2200) / 1000;
+  const laneTan = thresholds?.lane_angle_tan || 0.1417;
+  const halfTan = thresholds?.fov_half_tan || 0.425;
   els.rangeLabel.textContent = `${maxRange.toFixed(1)} m`;
 
   ctx.clearRect(0, 0, w, h);
@@ -99,10 +101,16 @@ function drawCloud(points, thresholds, path = "") {
   ctx.strokeStyle = "#ffffff66";
   ctx.beginPath();
   ctx.moveTo(originX, originY);
-  ctx.lineTo(originX - maxRange * 0.18 * scale, originY - maxRange * scale);
+  ctx.lineTo(originX - maxRange * laneTan * scale, originY - maxRange * scale);
   ctx.moveTo(originX, originY);
-  ctx.lineTo(originX + maxRange * 0.18 * scale, originY - maxRange * scale);
+  ctx.lineTo(originX + maxRange * laneTan * scale, originY - maxRange * scale);
+  ctx.moveTo(originX, originY);
+  ctx.lineTo(originX - maxRange * halfTan * scale, originY - maxRange * scale);
+  ctx.moveTo(originX, originY);
+  ctx.lineTo(originX + maxRange * halfTan * scale, originY - maxRange * scale);
   ctx.stroke();
+
+  drawSuggestedPath(originX, originY, scale, maxRange, laneTan, halfTan, path);
 
   for (const [x, z] of points) {
     const px = originX + x * scale;
@@ -118,6 +126,64 @@ function drawCloud(points, thresholds, path = "") {
   ctx.fillText("RIGHT", w - 88, 24);
   ctx.fillStyle = path.includes("forward") ? "#49d17d" : "#eef4f5";
   ctx.fillText("FORWARD", originX - 28, 24);
+}
+
+function drawSuggestedPath(originX, originY, scale, maxRange, laneTan, halfTan, path) {
+  if (!path) return;
+  ctx.save();
+  const pathColor = path.includes("slow") ? "#ffd166" : "#49d17d";
+  ctx.lineWidth = 5;
+  ctx.strokeStyle = pathColor;
+  ctx.fillStyle = pathColor;
+
+  if (path.includes("stop")) {
+    ctx.strokeStyle = "#ff5d5d";
+    ctx.beginPath();
+    ctx.moveTo(originX - 24, originY - 42);
+    ctx.lineTo(originX + 24, originY - 78);
+    ctx.moveTo(originX + 24, originY - 42);
+    ctx.lineTo(originX - 24, originY - 78);
+    ctx.stroke();
+    ctx.restore();
+    return;
+  }
+
+  const targetTan = path.includes("left") ? -(halfTan + laneTan) / 2 : path.includes("right") ? (halfTan + laneTan) / 2 : 0;
+  const points = [];
+  const leftEdge = [];
+  const rightEdge = [];
+
+  for (let i = 0; i < 18; i += 1) {
+    const t = i / 17;
+    const z = maxRange * (0.12 + t * 0.62);
+    const blend = 1 - Math.pow(1 - t, 2);
+    const x = targetTan * z * blend;
+    const px = originX + x * scale;
+    const py = originY - z * scale;
+    const halfWidth = (0.28 * (1 - t) + 0.08 * t) * scale;
+    points.push([px, py]);
+    leftEdge.push([px - halfWidth, py]);
+    rightEdge.push([px + halfWidth, py]);
+  }
+
+  ctx.globalAlpha = 0.2;
+  ctx.beginPath();
+  for (const [i, point] of leftEdge.entries()) {
+    if (i === 0) ctx.moveTo(point[0], point[1]);
+    else ctx.lineTo(point[0], point[1]);
+  }
+  for (const point of rightEdge.reverse()) ctx.lineTo(point[0], point[1]);
+  ctx.closePath();
+  ctx.fill();
+  ctx.globalAlpha = 1;
+
+  ctx.beginPath();
+  for (const [i, point] of points.entries()) {
+    if (i === 0) ctx.moveTo(point[0], point[1]);
+    else ctx.lineTo(point[0], point[1]);
+  }
+  ctx.stroke();
+  ctx.restore();
 }
 
 function drawRangeArc(originX, originY, radius, color) {

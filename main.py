@@ -24,11 +24,13 @@ RIGHT_STEREO_SOCKET: Final = dai.CameraBoardSocket.CAM_C
 
 OBSTACLE_LABEL: Final = "obstacle"
 MIN_RANGE_MM: Final = 250
-OBSTACLE_DISTANCE_MM: Final = 1_500
-CAUTION_DISTANCE_MM: Final = 2_200
-MAX_NAVIGATION_RANGE_MM: Final = 3_500
+OBSTACLE_DISTANCE_MM: Final = 1_000
+CAUTION_DISTANCE_MM: Final = 2_000
+MAX_NAVIGATION_RANGE_MM: Final = 5_500
 MIN_LANE_POINTS: Final = 80
-LANE_ANGLE_TAN: Final = 0.18
+FOV_FRACTION: Final = 0.90
+LANE_ANGLE_TAN: Final = FOV_FRACTION / 6
+FOV_HALF_TAN: Final = FOV_FRACTION / 2
 VERTICAL_LIMIT_MM: Final = 1_200
 DEFAULT_FRAME_WIDTH: Final = 640
 DEFAULT_FRAME_HEIGHT: Final = 400
@@ -145,7 +147,7 @@ def navigation_points(points: np.ndarray) -> np.ndarray:
         & (z_values >= MIN_RANGE_MM)
         & (z_values <= MAX_NAVIGATION_RANGE_MM)
         & (np.abs(y_values) <= VERTICAL_LIMIT_MM)
-        & (np.abs(x_values) <= z_values)
+        & (np.abs(x_values) <= z_values * FOV_HALF_TAN)
     )
     return points[mask]
 
@@ -250,18 +252,77 @@ def render_depth_frame(depth_frame: np.ndarray, state: NavigationState) -> bytes
     frame = cv2.applyColorMap(resized, cv2.COLORMAP_TURBO)
 
     height, width = frame.shape[:2]
-    left_x = width // 3
-    right_x = (width * 2) // 3
+    fov_left_x = int(width * (1 - FOV_FRACTION) / 2)
+    fov_right_x = width - fov_left_x
+    lane_width = fov_right_x - fov_left_x
+    left_x = fov_left_x + lane_width // 3
+    right_x = fov_left_x + (lane_width * 2) // 3
     color = (0, 0, 255) if state.detected else (0, 180, 0)
 
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (fov_left_x, 0), (fov_right_x, height), (255, 255, 255), -1)
+    frame = cv2.addWeighted(overlay, 0.07, frame, 0.93, 0)
+    cv2.line(frame, (fov_left_x, 0), (fov_left_x, height), (255, 255, 255), 1)
+    cv2.line(frame, (fov_right_x, 0), (fov_right_x, height), (255, 255, 255), 1)
     cv2.line(frame, (left_x, 0), (left_x, height), (255, 255, 255), 1)
     cv2.line(frame, (right_x, 0), (right_x, height), (255, 255, 255), 1)
+    draw_suggested_path(cv2, frame, state.recommended_path, fov_left_x, left_x, right_x, fov_right_x)
     cv2.putText(frame, state.label.upper(), (18, 36), cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2)
     cv2.putText(frame, state.recommended_path, (18, 72), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
     cv2.putText(frame, state.reason, (18, height - 24), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
 
     success, encoded = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY])
     return encoded.tobytes() if success else None
+
+
+def draw_suggested_path(
+    cv2_module: Any,
+    frame: np.ndarray,
+    recommended_path: str,
+    fov_left_x: int,
+    left_x: int,
+    right_x: int,
+    fov_right_x: int,
+) -> None:
+    """Draw a corridor line through the currently recommended clear path."""
+
+    height, width = frame.shape[:2]
+    if recommended_path in {"stop", "slow_or_stop"}:
+        cv2_module.line(frame, (width // 2 - 42, height - 88), (width // 2 + 42, height - 28), (0, 0, 255), 6)
+        cv2_module.line(frame, (width // 2 + 42, height - 88), (width // 2 - 42, height - 28), (0, 0, 255), 6)
+        return
+
+    target_centers = {
+        "go_left": (fov_left_x + left_x) // 2,
+        "forward": width // 2,
+        "forward_slow": width // 2,
+        "go_right": (right_x + fov_right_x) // 2,
+    }
+    target_x = target_centers.get(recommended_path, width // 2)
+    path_color = (0, 220, 0)
+    if recommended_path == "forward_slow":
+        path_color = (0, 200, 255)
+
+    y_values = np.linspace(height - 26, max(46, int(height * 0.24)), 18)
+    t_values = np.linspace(0.0, 1.0, len(y_values))
+    x_values = (1 - t_values) ** 2 * (width / 2) + (1 - (1 - t_values) ** 2) * target_x
+    centerline = np.column_stack([x_values, y_values]).astype(np.int32)
+
+    corridor_width_bottom = max(42, int(width * 0.12))
+    corridor_width_top = max(12, int(width * 0.035))
+    left_edge = []
+    right_edge = []
+    for point, progress in zip(centerline, t_values):
+        half_width = int((corridor_width_bottom * (1 - progress) + corridor_width_top * progress) / 2)
+        left_edge.append([point[0] - half_width, point[1]])
+        right_edge.append([point[0] + half_width, point[1]])
+
+    corridor = np.array(left_edge + right_edge[::-1], dtype=np.int32)
+    overlay = frame.copy()
+    cv2_module.fillPoly(overlay, [corridor], path_color)
+    cv2_module.addWeighted(overlay, 0.18, frame, 0.82, 0, frame)
+    cv2_module.polylines(frame, [centerline], False, path_color, 5, lineType=cv2_module.LINE_AA)
+    cv2_module.circle(frame, tuple(centerline[-1]), 8, path_color, -1, lineType=cv2_module.LINE_AA)
 
 
 def get_cv2() -> Any | None:
@@ -378,6 +439,9 @@ class FrontendHandler(BaseHTTPRequestHandler):
                     "obstacle_mm": OBSTACLE_DISTANCE_MM,
                     "caution_mm": CAUTION_DISTANCE_MM,
                     "max_range_mm": MAX_NAVIGATION_RANGE_MM,
+                    "fov_fraction": FOV_FRACTION,
+                    "lane_angle_tan": LANE_ANGLE_TAN,
+                    "fov_half_tan": FOV_HALF_TAN,
                 },
                 "viewer": {
                     "frame_width": FRAME_SIZE[0],
