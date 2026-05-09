@@ -1,13 +1,23 @@
 identifier = "com.gdghack2026.obstacle-detector"
 app_version = "0.1.0"
+cwd = "/app"
 entrypoint = ["bash", "-c", "python3 /app/main.py"]
 assign_frontend_port = true
 
 prepare_container = [
   { type = "COPY", source = "requirements.txt", target = "requirements.txt" },
+  { type = "COPY", source = "main.py", target = "main.py" },
+  { type = "COPY", source = "frontend", target = "frontend" },
   { type = "RUN", command = "apt-get update" },
   { type = "RUN", command = "apt-get install -y python3-pip" },
   { type = "RUN", command = "pip3 install -r /app/requirements.txt --break-system-packages" },
 ]
 
 build_steps = []
+
+[env]
+DEBUG_STREAM_FPS = "18"
+DEBUG_FRAME_WIDTH = "640"
+DEBUG_FRAME_HEIGHT = "400"
+DEBUG_JPEG_QUALITY = "76"
+POINT_SAMPLE_LIMIT = "1200"

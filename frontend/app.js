@@ -14,6 +14,9 @@ const els = {
   rightValue: document.getElementById("rightValue"),
   cloud: document.getElementById("cloud"),
   rangeLabel: document.getElementById("rangeLabel"),
+  viewerFps: document.getElementById("viewerFps"),
+  viewerResolution: document.getElementById("viewerResolution"),
+  viewerPoints: document.getElementById("viewerPoints"),
 };
 
 const ctx = els.cloud.getContext("2d");
@@ -37,6 +40,7 @@ function updateStatus(data) {
 
   if (!data.state) {
     drawCloud([], data.thresholds);
+    updateViewerStats(data.viewer, 0);
     return;
   }
 
@@ -50,7 +54,15 @@ function updateStatus(data) {
   setLane("left", state.lane_clearance_mm.left);
   setLane("center", state.lane_clearance_mm.center);
   setLane("right", state.lane_clearance_mm.right);
+  updateViewerStats(data.viewer, state.sample_points?.length || 0);
   drawCloud(state.sample_points || [], data.thresholds, state.recommended_path);
+}
+
+function updateViewerStats(viewer, pointCount) {
+  if (!viewer) return;
+  els.viewerFps.textContent = `${viewer.stream_fps} FPS`;
+  els.viewerResolution.textContent = `${viewer.frame_width} x ${viewer.frame_height}`;
+  els.viewerPoints.textContent = `${pointCount} / ${viewer.point_sample_limit} pts`;
 }
 
 function drawCloud(points, thresholds, path = "") {

@@ -1,3 +1,6 @@
 AGENTS.md
 ./docs/
 .venv/
+com-*
+pipeline*
+.oakignore

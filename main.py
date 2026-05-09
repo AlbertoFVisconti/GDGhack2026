@@ -30,8 +30,11 @@ MAX_NAVIGATION_RANGE_MM: Final = 3_500
 MIN_LANE_POINTS: Final = 80
 LANE_ANGLE_TAN: Final = 0.18
 VERTICAL_LIMIT_MM: Final = 1_200
-REPORT_INTERVAL_SECONDS: Final = 0.5
-FRAME_SIZE: Final = (640, 400)
+DEFAULT_FRAME_WIDTH: Final = 640
+DEFAULT_FRAME_HEIGHT: Final = 400
+DEFAULT_STREAM_FPS: Final = 18
+DEFAULT_JPEG_QUALITY: Final = 76
+DEFAULT_POINT_SAMPLE_LIMIT: Final = 1_200
 
 FRONTEND_DIR: Final = Path(__file__).resolve().parent / "frontend"
 
@@ -42,6 +45,25 @@ _latest_frame: bytes | None = None
 _pipeline_status = "starting"
 _pipeline_error: str | None = None
 _cv2: Any | None = None
+
+
+def env_int(name: str, default: int, minimum: int, maximum: int) -> int:
+    """Read a bounded integer from the environment."""
+
+    try:
+        value = int(os.getenv(name, str(default)))
+    except ValueError:
+        return default
+    return max(minimum, min(maximum, value))
+
+
+FRAME_SIZE: Final = (
+    env_int("DEBUG_FRAME_WIDTH", DEFAULT_FRAME_WIDTH, 320, 1280),
+    env_int("DEBUG_FRAME_HEIGHT", DEFAULT_FRAME_HEIGHT, 240, 720),
+)
+STREAM_FPS: Final = env_int("DEBUG_STREAM_FPS", DEFAULT_STREAM_FPS, 1, 30)
+JPEG_QUALITY: Final = env_int("DEBUG_JPEG_QUALITY", DEFAULT_JPEG_QUALITY, 35, 95)
+POINT_SAMPLE_LIMIT: Final = env_int("POINT_SAMPLE_LIMIT", DEFAULT_POINT_SAMPLE_LIMIT, 150, 5_000)
 
 
 @dataclass(frozen=True)
@@ -173,7 +195,7 @@ def choose_path(clearance: dict[str, int | None]) -> tuple[str, str]:
     return f"go_{best_lane}", f"obstacle ahead; {best_lane} lane has more clearance"
 
 
-def sample_points(points: np.ndarray, max_points: int = 900) -> list[list[float]]:
+def sample_points(points: np.ndarray, max_points: int = POINT_SAMPLE_LIMIT) -> list[list[float]]:
     """Downsample navigation points for browser-side top-down visualization."""
 
     if points.shape[0] == 0:
@@ -238,7 +260,7 @@ def render_depth_frame(depth_frame: np.ndarray, state: NavigationState) -> bytes
     cv2.putText(frame, state.recommended_path, (18, 72), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
     cv2.putText(frame, state.reason, (18, height - 24), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
 
-    success, encoded = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 82])
+    success, encoded = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY])
     return encoded.tobytes() if success else None
 
 
@@ -283,7 +305,6 @@ def set_pipeline_status(status: str, error: str | None = None) -> None:
 def pipeline_worker() -> None:
     """Run DepthAI point-cloud processing in a background thread."""
 
-    last_report = 0.0
     try:
         set_pipeline_status("creating")
         pipeline, queues = create_pipeline()
@@ -300,10 +321,7 @@ def pipeline_worker() -> None:
                 if isinstance(depth_message, dai.ImgFrame):
                     frame = render_depth_frame(depth_message.getFrame(), state)
 
-                now = time.monotonic()
-                if now - last_report >= REPORT_INTERVAL_SECONDS:
-                    update_runtime_state(state, frame)
-                    last_report = now
+                update_runtime_state(state, frame)
 
             set_pipeline_status("stopping")
             pipeline.stop()
@@ -361,6 +379,13 @@ class FrontendHandler(BaseHTTPRequestHandler):
                     "caution_mm": CAUTION_DISTANCE_MM,
                     "max_range_mm": MAX_NAVIGATION_RANGE_MM,
                 },
+                "viewer": {
+                    "frame_width": FRAME_SIZE[0],
+                    "frame_height": FRAME_SIZE[1],
+                    "stream_fps": STREAM_FPS,
+                    "jpeg_quality": JPEG_QUALITY,
+                    "point_sample_limit": POINT_SAMPLE_LIMIT,
+                },
             }
         data = json.dumps(payload, separators=(",", ":")).encode()
         self.send_response(HTTPStatus.OK)
@@ -384,7 +409,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
             self.wfile.write(b"--frame\r\nContent-Type: image/jpeg\r\n\r\n")
             self.wfile.write(frame)
             self.wfile.write(b"\r\n")
-            time.sleep(0.08)
+            time.sleep(1 / STREAM_FPS)
 
 
 def serve_frontend() -> None:

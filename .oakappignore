@@ -2,3 +2,6 @@
 .venv
 __pycache__
 *.pyc
+*.oakapp
+pipeline_schema.json
+com-*
