@@ -17,9 +17,12 @@ const els = {
   viewerFps: document.getElementById("viewerFps"),
   viewerResolution: document.getElementById("viewerResolution"),
   viewerPoints: document.getElementById("viewerPoints"),
+  ttsCount: document.getElementById("ttsCount"),
+  ttsEvents: document.getElementById("ttsEvents"),
 };
 
 const ctx = els.cloud.getContext("2d");
+let latestData = null;
 
 function formatMm(value) {
   if (value === null || value === undefined) return "--";
@@ -41,6 +44,7 @@ function updateStatus(data) {
   if (!data.state) {
     drawCloud([], data.thresholds);
     updateViewerStats(data.viewer, 0);
+    updateTtsEvents(data.tts_events || []);
     return;
   }
 
@@ -55,7 +59,28 @@ function updateStatus(data) {
   setLane("center", state.lane_clearance_mm.center);
   setLane("right", state.lane_clearance_mm.right);
   updateViewerStats(data.viewer, state.sample_points?.length || 0);
+  updateTtsEvents(data.tts_events || []);
   drawCloud(state.sample_points || [], data.thresholds, state.recommended_path);
+}
+
+function updateTtsEvents(events) {
+  els.ttsCount.textContent = String(events.length);
+  if (!events.length) {
+    els.ttsEvents.innerHTML = "<p>No speech events yet.</p>";
+    return;
+  }
+
+  els.ttsEvents.innerHTML = events
+    .slice()
+    .reverse()
+    .map((event) => {
+      const label = event.type === "camera_status" ? "CameraStatus" : "DescribeInput";
+      const payload = event.payload || {};
+      const message = payload.hint || `connected: ${payload.connected}`;
+      const time = new Date((event.timestamp || 0) * 1000).toLocaleTimeString();
+      return `<div class="tts-event"><strong>${label}</strong><span>${message}</span><span>${time}</span></div>`;
+    })
+    .join("");
 }
 
 function updateViewerStats(viewer, pointCount) {
@@ -148,7 +173,12 @@ function drawSuggestedPath(originX, originY, scale, maxRange, laneTan, halfTan, 
     return;
   }
 
-  const targetTan = path.includes("left") ? -(halfTan + laneTan) / 2 : path.includes("right") ? (halfTan + laneTan) / 2 : 0;
+  const targetTan =
+    path.includes("scan_left") ? -halfTan :
+    path.includes("scan_right") ? halfTan :
+    path.includes("left") ? -(halfTan + laneTan) / 2 :
+    path.includes("right") ? (halfTan + laneTan) / 2 :
+    0;
   const points = [];
   const leftEdge = [];
   const rightEdge = [];
@@ -197,12 +227,21 @@ function drawRangeArc(originX, originY, radius, color) {
 async function poll() {
   try {
     const response = await fetch("/api/status", { cache: "no-store" });
-    updateStatus(await response.json());
+    latestData = await response.json();
+    updateStatus(latestData);
   } catch {
     els.pipelineStatus.textContent = "offline";
     els.statusDot.className = "dot error";
   }
 }
 
+function animateRadar() {
+  if (latestData?.state) {
+    drawCloud(latestData.state.sample_points || [], latestData.thresholds, latestData.state.recommended_path);
+  }
+  requestAnimationFrame(animateRadar);
+}
+
 poll();
-setInterval(poll, 500);
+animateRadar();
+setInterval(poll, 250);

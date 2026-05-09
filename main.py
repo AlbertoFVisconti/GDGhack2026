@@ -9,6 +9,8 @@ import signal
 import threading
 import time
 import traceback
+import urllib.error
+import urllib.request
 from dataclasses import asdict, dataclass
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -37,6 +39,9 @@ DEFAULT_FRAME_HEIGHT: Final = 400
 DEFAULT_STREAM_FPS: Final = 18
 DEFAULT_JPEG_QUALITY: Final = 76
 DEFAULT_POINT_SAMPLE_LIMIT: Final = 1_200
+DEFAULT_TTS_MIN_INTERVAL_SECONDS: Final = 4.0
+DEFAULT_TTS_STABLE_FRAMES: Final = 3
+DEFAULT_WALL_STOP_FRAMES: Final = 16
 
 FRONTEND_DIR: Final = Path(__file__).resolve().parent / "frontend"
 
@@ -47,6 +52,7 @@ _latest_frame: bytes | None = None
 _pipeline_status = "starting"
 _pipeline_error: str | None = None
 _cv2: Any | None = None
+_tts_events: list[dict[str, object]] = []
 
 
 def env_int(name: str, default: int, minimum: int, maximum: int) -> int:
@@ -59,6 +65,23 @@ def env_int(name: str, default: int, minimum: int, maximum: int) -> int:
     return max(minimum, min(maximum, value))
 
 
+def env_float(name: str, default: float, minimum: float, maximum: float) -> float:
+    """Read a bounded float from the environment."""
+
+    try:
+        value = float(os.getenv(name, str(default)))
+    except ValueError:
+        return default
+    return max(minimum, min(maximum, value))
+
+
+def env_url(name: str) -> str | None:
+    """Read a non-empty URL from the environment."""
+
+    value = os.getenv(name, "").strip()
+    return value or None
+
+
 FRAME_SIZE: Final = (
     env_int("DEBUG_FRAME_WIDTH", DEFAULT_FRAME_WIDTH, 320, 1280),
     env_int("DEBUG_FRAME_HEIGHT", DEFAULT_FRAME_HEIGHT, 240, 720),
@@ -66,6 +89,13 @@ FRAME_SIZE: Final = (
 STREAM_FPS: Final = env_int("DEBUG_STREAM_FPS", DEFAULT_STREAM_FPS, 1, 30)
 JPEG_QUALITY: Final = env_int("DEBUG_JPEG_QUALITY", DEFAULT_JPEG_QUALITY, 35, 95)
 POINT_SAMPLE_LIMIT: Final = env_int("POINT_SAMPLE_LIMIT", DEFAULT_POINT_SAMPLE_LIMIT, 150, 5_000)
+TTS_CAMERA_STATUS_URL: Final = env_url("TTS_CAMERA_STATUS_URL")
+TTS_DESCRIBE_URL: Final = env_url("TTS_DESCRIBE_URL")
+TTS_MIN_INTERVAL_SECONDS: Final = env_float(
+    "TTS_MIN_INTERVAL_SECONDS", DEFAULT_TTS_MIN_INTERVAL_SECONDS, 1.0, 30.0
+)
+TTS_STABLE_FRAMES: Final = env_int("TTS_STABLE_FRAMES", DEFAULT_TTS_STABLE_FRAMES, 1, 20)
+WALL_STOP_FRAMES: Final = env_int("WALL_STOP_FRAMES", DEFAULT_WALL_STOP_FRAMES, 4, 120)
 
 
 @dataclass(frozen=True)
@@ -81,6 +111,154 @@ class NavigationState:
     reason: str
     sample_points: list[list[float]]
     timestamp: float
+
+
+class TtsNotifier:
+    """Notify a text-to-speech service when camera and guidance state changes."""
+
+    def __init__(
+        self,
+        camera_status_url: str | None,
+        describe_url: str | None,
+        min_interval_seconds: float,
+        stable_frames: int,
+    ) -> None:
+        """Create a notifier for the generated TTS API client endpoints."""
+
+        self.camera_status_url = camera_status_url
+        self.describe_url = describe_url
+        self.min_interval_seconds = min_interval_seconds
+        self.stable_frames = stable_frames
+        self._camera_connected_sent = False
+        self._candidate_path: str | None = None
+        self._candidate_count = 0
+        self._last_spoken_path: str | None = None
+        self._last_spoken_at = 0.0
+
+    def configure_dummy_urls(self, port: int) -> None:
+        """Use local dummy endpoints when no external TTS URLs are configured."""
+
+        if self.camera_status_url is None:
+            self.camera_status_url = f"http://127.0.0.1:{port}/dummy/camera-status"
+        if self.describe_url is None:
+            self.describe_url = f"http://127.0.0.1:{port}/dummy/describe"
+
+    def notify_camera_connected(self) -> None:
+        """Send CameraStatus once after the camera pipeline is running."""
+
+        if self._camera_connected_sent:
+            return
+        self._camera_connected_sent = True
+        self._post_json(self.camera_status_url, {"connected": True}, "camera_status")
+
+    def maybe_describe(self, state: NavigationState) -> None:
+        """Send a DescribeInput hint only after a stable recommendation change."""
+
+        path = state.recommended_path
+        if path == self._candidate_path:
+            self._candidate_count += 1
+        else:
+            self._candidate_path = path
+            self._candidate_count = 1
+
+        now = time.monotonic()
+        if self._candidate_count < self.stable_frames:
+            return
+        if path == self._last_spoken_path:
+            return
+        if now - self._last_spoken_at < self.min_interval_seconds:
+            return
+
+        hint = speech_hint(path)
+        self._last_spoken_path = path
+        self._last_spoken_at = now
+        self._post_json(self.describe_url, {"hint": hint}, "describe")
+
+    def _post_json(self, url: str | None, payload: dict[str, object], event: str) -> None:
+        """POST a JSON payload to the configured TTS endpoint."""
+
+        if not url:
+            log_json({"event": f"tts_{event}_skipped", "payload": payload, "reason": "url_not_configured"})
+            return
+
+        data = json.dumps(payload).encode("utf-8")
+        request = urllib.request.Request(
+            url,
+            data=data,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=0.35) as response:
+                log_json({"event": f"tts_{event}_sent", "status": response.status, "payload": payload})
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            log_json({"event": f"tts_{event}_failed", "error": repr(exc), "payload": payload})
+
+
+def speech_hint(recommended_path: str) -> str:
+    """Convert internal path labels into short spoken guidance."""
+
+    hints = {
+        "forward": "Path clear. Keep going forward.",
+        "forward_slow": "Obstacle ahead. Move forward slowly.",
+        "go_left": "Obstacle ahead. Go left.",
+        "go_right": "Obstacle ahead. Go right.",
+        "stop": "Stop. Obstacle ahead.",
+        "slow_or_stop": "Slow down. Path unclear.",
+        "scan_left": "Blocked ahead. Turn left slowly and scan for an opening.",
+        "scan_right": "Blocked ahead. Turn right slowly and scan for an opening.",
+    }
+    return hints.get(recommended_path, recommended_path.replace("_", " "))
+
+
+class SearchRouteAdvisor:
+    """Escalate repeated stop states into turn-and-scan guidance."""
+
+    def __init__(self, wall_stop_frames: int) -> None:
+        """Create a wall/blocked-path advisor."""
+
+        self.wall_stop_frames = wall_stop_frames
+        self._stop_count = 0
+        self._turn_direction = "left"
+
+    def apply(self, state: NavigationState) -> NavigationState:
+        """Return adjusted guidance when the user appears stopped at a wall."""
+
+        if state.recommended_path not in {"stop", "slow_or_stop"}:
+            self._stop_count = 0
+            return state
+
+        self._stop_count += 1
+        if self._stop_count < self.wall_stop_frames:
+            return state
+
+        clearance = state.lane_clearance_mm
+        left = clearance.get("left") or 0
+        right = clearance.get("right") or 0
+        if abs(left - right) > 250:
+            self._turn_direction = "left" if left > right else "right"
+
+        path = f"scan_{self._turn_direction}"
+        return NavigationState(
+            label=state.label,
+            detected=state.detected,
+            recommended_path=path,
+            nearest_obstacle_mm=state.nearest_obstacle_mm,
+            lane_clearance_mm=state.lane_clearance_mm,
+            confidence=state.confidence,
+            reason=f"blocked ahead; turn {self._turn_direction} slowly to search for an exit route",
+            sample_points=state.sample_points,
+            timestamp=state.timestamp,
+        )
+
+
+tts_notifier = TtsNotifier(
+    TTS_CAMERA_STATUS_URL,
+    TTS_DESCRIBE_URL,
+    TTS_MIN_INTERVAL_SECONDS,
+    TTS_STABLE_FRAMES,
+)
+search_route_advisor = SearchRouteAdvisor(WALL_STOP_FRAMES)
 
 
 def log_json(payload: dict[str, object]) -> None:
@@ -297,6 +475,8 @@ def draw_suggested_path(
         "forward": width // 2,
         "forward_slow": width // 2,
         "go_right": (right_x + fov_right_x) // 2,
+        "scan_left": fov_left_x,
+        "scan_right": fov_right_x,
     }
     target_x = target_centers.get(recommended_path, width // 2)
     path_color = (0, 220, 0)
@@ -350,6 +530,7 @@ def update_runtime_state(state: NavigationState, frame: bytes | None) -> None:
         _latest_state = state
         if frame is not None:
             _latest_frame = frame
+    tts_notifier.maybe_describe(state)
     log_json(asdict(state))
 
 
@@ -373,9 +554,10 @@ def pipeline_worker() -> None:
         with pipeline:
             pipeline.start()
             set_pipeline_status("running")
+            tts_notifier.notify_camera_connected()
             while pipeline.isRunning() and not _should_stop:
                 point_message = queues["points"].get()
-                state = analyze_point_cloud(points_to_array(point_message))
+                state = search_route_advisor.apply(analyze_point_cloud(points_to_array(point_message)))
 
                 depth_message = queues["depth"].tryGet()
                 frame = None
@@ -394,6 +576,8 @@ def pipeline_worker() -> None:
 class FrontendHandler(BaseHTTPRequestHandler):
     """Serve static frontend files, status JSON, and MJPEG depth video."""
 
+    protocol_version = "HTTP/1.1"
+
     def do_GET(self) -> None:
         """Route HTTP GET requests."""
 
@@ -407,6 +591,16 @@ class FrontendHandler(BaseHTTPRequestHandler):
             self._serve_status()
         elif self.path == "/stream/depth.mjpg":
             self._serve_mjpeg()
+        else:
+            self.send_error(HTTPStatus.NOT_FOUND)
+
+    def do_POST(self) -> None:
+        """Route dummy TTS POST requests."""
+
+        if self.path == "/dummy/camera-status":
+            self._serve_dummy_tts_post("camera_status")
+        elif self.path == "/dummy/describe":
+            self._serve_dummy_tts_post("describe")
         else:
             self.send_error(HTTPStatus.NOT_FOUND)
 
@@ -431,10 +625,12 @@ class FrontendHandler(BaseHTTPRequestHandler):
 
         with _state_lock:
             state = asdict(_latest_state) if _latest_state else None
+            tts_events = list(_tts_events[-12:])
             payload = {
                 "pipeline_status": _pipeline_status,
                 "pipeline_error": _pipeline_error,
                 "state": state,
+                "tts_events": tts_events,
                 "thresholds": {
                     "obstacle_mm": OBSTACLE_DISTANCE_MM,
                     "caution_mm": CAUTION_DISTANCE_MM,
@@ -449,6 +645,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
                     "stream_fps": STREAM_FPS,
                     "jpeg_quality": JPEG_QUALITY,
                     "point_sample_limit": POINT_SAMPLE_LIMIT,
+                    "wall_stop_frames": WALL_STOP_FRAMES,
                 },
             }
         data = json.dumps(payload, separators=(",", ":")).encode()
@@ -475,11 +672,39 @@ class FrontendHandler(BaseHTTPRequestHandler):
             self.wfile.write(b"\r\n")
             time.sleep(1 / STREAM_FPS)
 
+    def _serve_dummy_tts_post(self, event_type: str) -> None:
+        """Record a dummy TTS payload so the frontend can display it."""
+
+        content_length = int(self.headers.get("Content-Length", "0"))
+        raw_body = self.rfile.read(content_length) if content_length > 0 else b"{}"
+        try:
+            payload = json.loads(raw_body.decode("utf-8"))
+        except json.JSONDecodeError:
+            payload = {"raw": raw_body.decode("utf-8", errors="replace")}
+
+        event = {
+            "type": event_type,
+            "payload": payload,
+            "timestamp": time.time(),
+        }
+        with _state_lock:
+            _tts_events.append(event)
+            del _tts_events[:-30]
+
+        log_json({"event": "dummy_tts_received", **event})
+        data = json.dumps({"queued": True}, separators=(",", ":")).encode()
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
 
 def serve_frontend() -> None:
     """Start the frontend server and keep it alive until shutdown."""
 
     port = int(os.getenv("OAKAPP_STATIC_FRONTEND_PORT", os.getenv("PORT", "8080")))
+    tts_notifier.configure_dummy_urls(port)
     server = ThreadingHTTPServer(("0.0.0.0", port), FrontendHandler)
     log_json({"event": "frontend_ready", "url": f"http://0.0.0.0:{port}"})
     try:
