@@ -27,7 +27,7 @@ with dai.Pipeline() as pipeline:
     monoLeftOut.link(stereo.left)
     monoRightOut.link(stereo.right)
 
-    # Create the depth queue directly from the node
+    # Create the depth queue
     qDepth = stereo.depth.createOutputQueue()
 
     # 5. Define YOLOv10 Node
@@ -35,7 +35,7 @@ with dai.Pipeline() as pipeline:
     model_description = dai.NNModelDescription("luxonis/yolov10-nano:coco-512x288")
     yolo = pipeline.create(dai.node.DetectionNetwork).build(camRgb, model_description)
 
-    # Create the YOLO queue directly
+    # Create the YOLO queue
     qYolo = yolo.out.createOutputQueue()
 
     # Standard COCO dataset labels
@@ -44,12 +44,11 @@ with dai.Pipeline() as pipeline:
     # 6. Start the Pipeline
     pipeline.start()
     
-    print("Pipeline running. YOLO-First Architecture active...")
+    print("Pipeline running. Monitoring central path for objects...")
 
     cooldown_dict = {}
     cooldown_seconds = 5.0
 
-    # The loop now runs as long as the pipeline is active
     while pipeline.isRunning():
         inDepth = qDepth.get()
         inYolo = qYolo.tryGet()
@@ -57,53 +56,61 @@ with dai.Pipeline() as pipeline:
         depthFrame = inDepth.getFrame()
         height, width = depthFrame.shape
         
-        # Create the visual map right away
+        # --- PATH VISUALIZATION SETTINGS ---
+        # The ratio of the screen width to consider as "directly ahead"
+        path_width_ratio = 0.40 
+        
+        left_boundary = int(width * (0.5 - (path_width_ratio / 2)))
+        right_boundary = int(width * (0.5 + (path_width_ratio / 2)))
+        
+        # Create the visual depth map
         depth_colormap = cv2.applyColorMap(cv2.convertScaleAbs(depthFrame, alpha=0.03), cv2.COLORMAP_JET)
 
-        # YOLO-FIRST LOGIC: Only check depth if YOLO actually sees something
+        # Plot the path boundary lines (Green lines)
+        cv2.line(depth_colormap, (left_boundary, 0), (left_boundary, height), (0, 255, 0), 2)
+        cv2.line(depth_colormap, (right_boundary, 0), (right_boundary, height), (0, 255, 0), 2)
+
         if inYolo is not None:
             detections = inYolo.detections
             
             for detection in detections:
                 label_name = labels[detection.label]
                 
-                # 1. Get the exact bounding box of the object (scaled to the screen size)
+                # Get the bounding box of the object
                 x1 = int(detection.xmin * width)
                 y1 = int(detection.ymin * height)
                 x2 = int(detection.xmax * width)
                 y2 = int(detection.ymax * height)
                 
-                # Protect against out-of-bounds coordinates
-                x1, y1 = max(0, x1), max(0, y1)
-                x2, y2 = min(width, x2), min(height, y2)
+                # Calculate the center of the object
+                object_center_x = (x1 + x2) // 2
                 
-                # 2. Extract ONLY the depth pixels inside the YOLO bounding box
-                object_roi = depthFrame[y1:y2, x1:x2]
-                valid_depths = object_roi[object_roi > 0] # Filter out blind spots (zeros)
-                
-                if len(valid_depths) > 0:
-                    # 3. Calculate the actual distance to this specific object
-                    avg_depth = np.mean(valid_depths)
+                # Check if the object is within the path boundaries
+                if left_boundary <= object_center_x <= right_boundary:
                     
-                    # Draw a box on the screen so you can see it working
-                    cv2.rectangle(depth_colormap, (x1, y1), (x2, y2), (255, 255, 255), 2)
-                    cv2.putText(depth_colormap, f"{label_name}: {avg_depth/1000:.1f}m", (x1, y1 - 10), 
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
+                    x1, y1 = max(0, x1), max(0, y1)
+                    x2, y2 = min(width, x2), min(height, y2)
                     
-                    # 4. Check if it's within your trigger range
-                    if avg_depth < trigger_range:
-                        current_time = time.time()
+                    object_roi = depthFrame[y1:y2, x1:x2]
+                    valid_depths = object_roi[object_roi > 0]
+                    
+                    if len(valid_depths) > 0:
+                        avg_depth = np.mean(valid_depths)
                         
-                        # 5. DEBOUNCE (Stop the spam)
-                        # We ONLY print if it's new, or if 5 seconds have passed for THIS specific label
-                        if label_name not in cooldown_dict or (current_time - cooldown_dict[label_name]) > cooldown_seconds:
+                        # Draw tracking box for objects in the path (White box)
+                        cv2.rectangle(depth_colormap, (x1, y1), (x2, y2), (255, 255, 255), 2)
+                        cv2.putText(depth_colormap, f"{label_name}: {avg_depth/1000:.1f}m", (x1, y1 - 10), 
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
+                        
+                        if avg_depth < trigger_range:
+                            current_time = time.time()
                             
-                            print(f"NOTIFY USER: '{label_name}' detected at {avg_depth/1000:.1f} meters!")
-                            
-                            # Reset the clock for this object
-                            cooldown_dict[label_name] = current_time
+                            # Debounce notification
+                            if label_name not in cooldown_dict or (current_time - cooldown_dict[label_name]) > cooldown_seconds:
+                                print(f"NOTIFY USER: '{label_name}' directly ahead at {avg_depth/1000:.1f} meters!")
+                                cooldown_dict[label_name] = current_time
 
-        cv2.imshow("Spatial Vision (YOLO-First)", depth_colormap)
+        cv2.imshow("Spatial Vision - Path Detection", depth_colormap)
 
         if cv2.waitKey(1) == ord('q'):
             break
