@@ -126,7 +126,7 @@ DEFAULT_TTS_MIN_INTERVAL_SECONDS: Final = 4.0
 DEFAULT_TTS_STABLE_FRAMES: Final = 3
 DEFAULT_WALL_STOP_FRAMES: Final = 16
 DEFAULT_YOLO_CONFIDENCE: Final = 0.35
-DEFAULT_YOLO_CENTER_FRACTION: Final = 0.55
+DEFAULT_YOLO_CENTER_FRACTION: Final = 0.40
 DEFAULT_OBJECT_NOTIFY_COOLDOWN_SECONDS: Final = 5.0
 OBJECT_DEPTH_PERCENTILE: Final = 50
 OBJECT_MOTION_WINDOW: Final = 6
@@ -738,6 +738,7 @@ def render_depth_frame(depth_frame: np.ndarray, state: NavigationState) -> bytes
     cv2.line(frame, (fov_right_x, 0), (fov_right_x, height), (255, 255, 255), 1)
     cv2.line(frame, (left_x, 0), (left_x, height), (255, 255, 255), 1)
     cv2.line(frame, (right_x, 0), (right_x, height), (255, 255, 255), 1)
+    draw_yolo_path_boundaries(cv2, frame)
     cv2.putText(frame, state.label.upper(), (18, 36), cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2)
     cv2.putText(frame, state.recommended_path, (18, 72), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
     cv2.putText(frame, state.reason, (18, height - 24), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
@@ -745,6 +746,16 @@ def render_depth_frame(depth_frame: np.ndarray, state: NavigationState) -> bytes
 
     success, encoded = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY])
     return encoded.tobytes() if success else None
+
+
+def draw_yolo_path_boundaries(cv2_module: Any, frame: np.ndarray) -> None:
+    """Draw the horizontal center band used for live YOLO obstacle alerts."""
+
+    height, width = frame.shape[:2]
+    left_boundary = int(width * (0.5 - YOLO_CENTER_FRACTION / 2))
+    right_boundary = int(width * (0.5 + YOLO_CENTER_FRACTION / 2))
+    cv2_module.line(frame, (left_boundary, 0), (left_boundary, height), (0, 255, 0), 2)
+    cv2_module.line(frame, (right_boundary, 0), (right_boundary, height), (0, 255, 0), 2)
 
 
 def draw_object_detections(cv2_module: Any, frame: np.ndarray, detections: list[ObjectDetection]) -> None:
