@@ -7,6 +7,8 @@ assign_frontend_port = true
 prepare_container = [
   { type = "COPY", source = "requirements.txt", target = "requirements.txt" },
   { type = "COPY", source = "main.py", target = "main.py" },
+  { type = "COPY", source = "tts.py", target = "tts.py" },
+  { type = "COPY", source = "webapp.py", target = "webapp.py" },
   { type = "COPY", source = "frontend", target = "frontend" },
   { type = "RUN", command = "apt-get update" },
   { type = "RUN", command = "apt-get install -y python3-pip" },
