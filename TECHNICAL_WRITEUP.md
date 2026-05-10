@@ -1,5 +1,12 @@
 # OAK 4 D Pro Navigation App Technical Writeup
 
+## TL;DR
+
+- **Point cloud decides whether the path is physically safe.**
+- **YOLO gives names to things when it can.**
+- **The local viewer explains what the algorithm is seeing.**
+- **The external Webapp turns guidance and room descriptions into user-facing speech.**
+
 ## Overview
 
 This repository contains a standalone OAK app for the Luxonis OAK 4 D Pro. Its goal is to help a visually impaired user understand whether the path in front of them is clear, blocked, or navigable by moving left or right. The system combines stereo depth, point-cloud analysis, object detection, and WebSocket-based speech events.
@@ -136,7 +143,6 @@ The app estimates more than just “blocked” or “not blocked.” `estimate_s
 - `partly_open`
 - `blocked_or_near_wall`
 - `wall`
-- `stairs`
 - `unknown`
 
 This classification is used in the debug UI, logs, reasoning text, and speech subject selection.
@@ -153,16 +159,6 @@ The wall score considers:
 - Whether both side lanes are also blocked.
 
 When confidence is high, the app reports a wall-like surface instead of a generic obstacle.
-
-### Stair Detection
-
-`estimate_stairs_confidence()` is a first-pass geometry detector for stairs. It focuses on the center walking corridor and looks for repeated height changes across forward distance bands. When the score is high enough, the app sets:
-
-- `space.kind = "stairs"`
-- `label = "stairs"`
-- `recommended_path = "stop"`
-
-This is intentionally conservative. The current behavior is to warn and stop rather than attempt to route the user onto or around stairs. The threshold should be tuned on real staircases because stereo depth can vary with lighting, texture, angle, and distance.
 
 ## YOLO Object Detection
 
@@ -298,36 +294,3 @@ Important environment variables include:
 - `YOLO_CONFIDENCE`
 - `YOLO_CENTER_FRACTION`
 - `VISION_WS_URL`
-
-## Current Limitations
-
-The current implementation is practical for a hackathon prototype, but it is not a certified mobility aid.
-
-Known limitations:
-
-- Stair detection is geometry-only and requires real-world tuning.
-- YOLO labels depend on the model classes; objects outside the model vocabulary become generic geometry hazards.
-- Point-cloud quality depends on lighting, surface texture, and stereo visibility.
-- The RGB debug stream and the depth stream are for development; the spoken guidance should remain the primary user-facing output.
-- Room descriptions are currently based on cached detections and coarse navigation state. A dedicated scene model can make this much richer.
-
-## Extension Points
-
-Good next engineering steps:
-
-- Add a trained class for `stairs`, `trash bin`, and other mobility-relevant hazards.
-- Fuse YOLO staircase detection with the current geometric `stairs_confidence`.
-- Add IMU/gyro logic to detect whether the user has actually turned after a scan instruction.
-- Tune thresholds from real hallway, sidewalk, wall, stair, and clutter recordings.
-- Improve `describe_surroundings()` with a richer object-recognition or scene-description model.
-- Persist short motion history for non-YOLO obstacles, not only labeled detections.
-
-## Mental Model
-
-The safest way to understand the system is:
-
-- **Point cloud decides whether the path is physically safe.**
-- **YOLO gives names to things when it can.**
-- **The local viewer explains what the algorithm is seeing.**
-- **The external Webapp turns guidance and room descriptions into user-facing speech.**
-
