@@ -10,10 +10,11 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Callable
+from urllib.parse import urlparse
 
 
 StatusPayloadFn = Callable[[], dict[str, object]]
-LatestFrameFn = Callable[[], bytes | None]
+LatestFrameFn = Callable[[str], bytes | None]
 ShouldStopFn = Callable[[], bool]
 LogFn = Callable[[dict[str, object]], None]
 
@@ -39,16 +40,19 @@ class FrontendHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         """Route HTTP GET requests."""
 
-        if self.path in {"/", "/index.html"}:
+        path = urlparse(self.path).path
+        if path in {"/", "/index.html"}:
             self._serve_file(self.context.frontend_dir / "index.html", "text/html")
-        elif self.path == "/styles.css":
+        elif path == "/styles.css":
             self._serve_file(self.context.frontend_dir / "styles.css", "text/css")
-        elif self.path == "/app.js":
+        elif path == "/app.js":
             self._serve_file(self.context.frontend_dir / "app.js", "application/javascript")
-        elif self.path == "/api/status":
+        elif path == "/api/status":
             self._serve_status()
-        elif self.path == "/stream/depth.mjpg":
-            self._serve_mjpeg()
+        elif path == "/stream/depth.mjpg":
+            self._serve_mjpeg("depth")
+        elif path == "/stream/rgb.mjpg":
+            self._serve_mjpeg("rgb")
         else:
             self.send_error(HTTPStatus.NOT_FOUND)
 
@@ -78,20 +82,34 @@ class FrontendHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
-    def _serve_mjpeg(self) -> None:
-        """Serve the latest rendered depth frame as MJPEG."""
+    def _serve_mjpeg(self, stream_name: str) -> None:
+        """Serve the latest rendered frame as MJPEG."""
 
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
+        self.send_header("Cache-Control", "no-store")
         self.end_headers()
+        self.context.log_json({"event": "stream_opened", "stream": stream_name})
+        last_wait_log_at = 0.0
         while not self.context.should_stop():
-            frame = self.context.get_latest_frame()
+            frame = self.context.get_latest_frame(stream_name)
             if frame is None:
+                now = time.time()
+                if now - last_wait_log_at >= 2.0:
+                    last_wait_log_at = now
+                    self.context.log_json({"event": "stream_waiting_for_frame", "stream": stream_name})
                 time.sleep(0.1)
                 continue
-            self.wfile.write(b"--frame\r\nContent-Type: image/jpeg\r\n\r\n")
-            self.wfile.write(frame)
-            self.wfile.write(b"\r\n")
+            try:
+                self.wfile.write(b"--frame\r\nContent-Type: image/jpeg\r\n\r\n")
+                self.wfile.write(frame)
+                self.wfile.write(b"\r\n")
+            except (BrokenPipeError, ConnectionResetError):
+                self.context.log_json({"event": "stream_closed", "stream": stream_name})
+                break
+            except OSError as exc:
+                self.context.log_json({"event": "stream_write_failed", "stream": stream_name, "error": repr(exc)})
+                break
             time.sleep(1 / self.context.stream_fps)
 
 
@@ -99,9 +117,20 @@ def serve_frontend(context: WebAppContext) -> None:
     """Start the frontend server and keep it alive until shutdown."""
 
     port = int(os.getenv("OAKAPP_STATIC_FRONTEND_PORT", os.getenv("PORT", "8080")))
+    bind_host = os.getenv("FRONTEND_BIND_HOST", "0.0.0.0")
+    public_host = os.getenv("FRONTEND_PUBLIC_HOST", bind_host)
+    public_port = int(os.getenv("FRONTEND_PUBLIC_PORT", str(port)))
+    public_url = f"http://{public_host}:{public_port}/"
     handler = type("ConfiguredFrontendHandler", (FrontendHandler,), {"context": context})
-    server = ThreadingHTTPServer(("0.0.0.0", port), handler)
-    context.log_json({"event": "frontend_ready", "url": f"http://0.0.0.0:{port}"})
+    server = ThreadingHTTPServer((bind_host, port), handler)
+    context.log_json(
+        {
+            "event": "frontend_ready",
+            "url": public_url,
+            "bind_host": bind_host,
+            "bind_port": port,
+        }
+    )
     try:
         server.serve_forever(poll_interval=0.5)
     finally:

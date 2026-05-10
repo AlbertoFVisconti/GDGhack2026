@@ -9,21 +9,35 @@
   <body>
     <main class="shell">
       <section class="video-pane">
-        <div class="stream-wrap">
-          <img id="depthStream" src="/stream/depth.mjpg" alt="Depth stream with obstacle overlay" />
-          <div class="hud">
-            <span id="statusDot" class="dot"></span>
-            <span id="pipelineStatus">Starting</span>
+        <div class="visual-grid">
+          <div class="stream-wrap">
+            <img id="videoStream" src="/stream/depth.mjpg" alt="Camera stream with obstacle overlay" />
+            <div class="hud">
+              <span id="statusDot" class="dot"></span>
+              <span id="pipelineStatus">Starting</span>
+            </div>
+            <div class="stream-switch" role="group" aria-label="Viewer stream">
+              <button id="depthMode" class="active" type="button">Depth</button>
+              <button id="rgbMode" type="button">RGB</button>
+            </div>
+            <div class="viewer-summary">
+              <strong id="viewerModeTitle">Depth Viewer</strong>
+              <span id="viewerModeHelp">Warm colors are closer. White dividers split left, center, and right path lanes.</span>
+              <span>Red text means an obstacle is inside the center threshold; green text means the suggested route is clear enough.</span>
+            </div>
+            <div class="viewer-stats">
+              <span id="viewerFps">-- FPS</span>
+              <span id="viewerResolution">--</span>
+              <span id="viewerPoints">-- pts</span>
+            </div>
           </div>
-          <div class="viewer-summary">
-            <strong>Depth Viewer</strong>
-            <span>Warm colors are closer. White dividers split left, center, and right path lanes.</span>
-            <span>Red text means an obstacle is inside the center threshold; green text means the suggested route is clear enough.</span>
-          </div>
-          <div class="viewer-stats">
-            <span id="viewerFps">-- FPS</span>
-            <span id="viewerResolution">--</span>
-            <span id="viewerPoints">-- pts</span>
+
+          <div class="radar-wrap">
+            <div class="radar-title">
+              <span>Top-Down Point Cloud</span>
+              <span id="rangeLabel">3.5 m</span>
+            </div>
+            <canvas id="cloud" width="720" height="500"></canvas>
           </div>
         </div>
       </section>
@@ -45,7 +59,7 @@
             <strong id="nearest">--</strong>
           </div>
           <div>
-            <span>Confidence</span>
+            <span>Route Confidence</span>
             <strong id="confidence">--</strong>
           </div>
         </section>
@@ -76,14 +90,6 @@
           <div id="objects" class="objects">
             <p>No YOLO objects yet.</p>
           </div>
-        </section>
-
-        <section class="cloud-panel">
-          <div class="panel-title">
-            <span>Top-Down Point Cloud</span>
-            <span id="rangeLabel">3.5 m</span>
-          </div>
-          <canvas id="cloud" width="720" height="500"></canvas>
         </section>
 
         <section class="tts-panel">

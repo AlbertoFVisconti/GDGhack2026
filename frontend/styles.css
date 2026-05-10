@@ -30,19 +30,25 @@ body {
 }
 
 .video-pane {
-  display: flex;
-  align-items: stretch;
   min-width: 0;
   background: #050708;
+}
+
+.visual-grid {
+  width: 100%;
+  min-height: 100vh;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(360px, 1fr);
 }
 
 .stream-wrap {
   position: relative;
   width: 100%;
   min-height: 100vh;
+  border-right: 1px solid var(--line);
 }
 
-#depthStream {
+#videoStream {
   width: 100%;
   height: 100%;
   object-fit: contain;
@@ -106,6 +112,52 @@ body {
   font-size: 12px;
 }
 
+.radar-wrap {
+  min-width: 0;
+  min-height: 100vh;
+  padding: 18px;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  gap: 12px;
+  background: #080c0f;
+}
+
+.radar-title {
+  display: flex;
+  justify-content: space-between;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.stream-switch {
+  position: absolute;
+  top: 64px;
+  left: 18px;
+  display: inline-flex;
+  padding: 3px;
+  gap: 3px;
+  background: rgb(8 12 14 / 78%);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+}
+
+.stream-switch button {
+  min-width: 64px;
+  height: 30px;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--muted);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.stream-switch button.active {
+  background: var(--accent);
+  color: #041015;
+}
+
 .dot {
   width: 10px;
   height: 10px;
@@ -134,7 +186,6 @@ body {
 .metric-grid > div,
 .lanes,
 .objects-panel,
-.cloud-panel,
 .tts-panel {
   background: var(--panel-2);
   border: 1px solid var(--line);
@@ -206,10 +257,6 @@ h1 {
 meter {
   width: 100%;
   height: 12px;
-}
-
-.cloud-panel {
-  padding: 14px;
 }
 
 .objects-panel {
@@ -298,7 +345,8 @@ meter {
 
 #cloud {
   width: 100%;
-  aspect-ratio: 13 / 9;
+  height: 100%;
+  min-height: 0;
   display: block;
   background: #0a0f12;
   border: 1px solid var(--line);
@@ -310,8 +358,19 @@ meter {
     grid-template-columns: 1fr;
   }
 
+  .visual-grid {
+    min-height: auto;
+    grid-template-columns: 1fr;
+  }
+
   .stream-wrap {
     min-height: 48vh;
+    border-right: 0;
+    border-bottom: 1px solid var(--line);
+  }
+
+  .radar-wrap {
+    min-height: 46vh;
   }
 
   .side-panel {

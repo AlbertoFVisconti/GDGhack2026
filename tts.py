@@ -39,9 +39,9 @@ class TtsNotifier:
         self.should_stop = should_stop
         self.log_json = log_json
         self._camera_connected_sent = False
-        self._candidate_path: str | None = None
+        self._candidate_signature: str | None = None
         self._candidate_count = 0
-        self._last_spoken_path: str | None = None
+        self._last_spoken_signature: str | None = None
         self._last_spoken_at = 0.0
         self._ws: Any | None = None
         self._ws_lock = threading.Lock()
@@ -61,23 +61,23 @@ class TtsNotifier:
     def maybe_describe(self, state: NavigationStateLike) -> None:
         """Send a description hint only after a stable recommendation change."""
 
-        path = state.recommended_path
-        if path == self._candidate_path:
+        signature = guidance_signature(state)
+        if signature == self._candidate_signature:
             self._candidate_count += 1
         else:
-            self._candidate_path = path
+            self._candidate_signature = signature
             self._candidate_count = 1
 
         now = time.monotonic()
         if self._candidate_count < self.stable_frames:
             return
-        if path == self._last_spoken_path:
+        if signature == self._last_spoken_signature:
             return
         if now - self._last_spoken_at < self.min_interval_seconds:
             return
 
-        text = speech_hint(path)
-        self._last_spoken_path = path
+        text = speech_hint(str(getattr(state, "recommended_path", "")), state)
+        self._last_spoken_signature = signature
         self._last_spoken_at = now
         payload = {"type": "description", "text": text}
         self.record_event("description", payload)
@@ -194,20 +194,98 @@ class TtsNotifier:
         self._ws = None
 
 
-def speech_hint(recommended_path: str) -> str:
+def speech_hint(recommended_path: str, state: NavigationStateLike | None = None) -> str:
     """Convert internal path labels into short spoken guidance."""
 
+    subject = detected_subject(state)
+    clearance = side_clearance_hint(state)
+    suffix = f" {clearance}" if clearance else ""
     hints = {
         "forward": "Path clear. Keep going forward.",
-        "forward_slow": "Obstacle ahead. Move forward slowly.",
-        "go_left": "Obstacle ahead. Go left.",
-        "go_right": "Obstacle ahead. Go right.",
-        "stop": "Stop. Obstacle ahead.",
+        "forward_slow": f"{subject} ahead. Move forward slowly.{suffix}",
+        "go_left": f"{subject} ahead. Go left.{suffix}",
+        "go_right": f"{subject} ahead. Go right.{suffix}",
+        "stop": f"Stop. {subject} ahead.{suffix}",
         "slow_or_stop": "Slow down. Path unclear.",
-        "scan_left": "Blocked ahead. Turn left slowly and scan for an opening.",
-        "scan_right": "Blocked ahead. Turn right slowly and scan for an opening.",
+        "scan_left": f"Blocked ahead. Turn left slowly and scan for an opening.{suffix}",
+        "scan_right": f"Blocked ahead. Turn right slowly and scan for an opening.{suffix}",
     }
     return hints.get(recommended_path, recommended_path.replace("_", " "))
+
+
+def guidance_signature(state: NavigationStateLike) -> str:
+    """Build the stable guidance identity used for debouncing speech."""
+
+    path = str(getattr(state, "recommended_path", "unknown"))
+    subject = detected_subject(state).lower()
+    if path in {"forward", "stop", "scan_left", "scan_right"}:
+        return path
+    if path == "slow_or_stop":
+        return path
+
+    clearance = getattr(state, "lane_clearance_mm", {}) or {}
+    if not isinstance(clearance, dict):
+        clearance = {}
+    center = distance_bucket(clearance.get("center"))
+    return f"{path}:{subject}:c{center}"
+
+
+def detected_subject(state: NavigationStateLike | None) -> str:
+    """Return a spoken subject from YOLO detections when available."""
+
+    detections = getattr(state, "object_detections", []) if state is not None else []
+    for detection in detections:
+        label = getattr(detection, "label", "")
+        if label:
+            return str(label).capitalize()
+
+    space = getattr(state, "space", None)
+    if getattr(space, "kind", "") == "wall":
+        return "Wall"
+    if getattr(space, "kind", "") == "blocked_or_near_wall":
+        return "Wall or broad surface"
+    if bool(getattr(state, "detected", False)):
+        return "Unrecognized obstacle"
+    return "Obstacle"
+
+
+def side_clearance_hint(state: NavigationStateLike | None) -> str:
+    """Return a compact spoken clearance summary when side guidance matters."""
+
+    if state is None:
+        return ""
+
+    path = str(getattr(state, "recommended_path", ""))
+    if path not in {"go_left", "go_right", "stop", "scan_left", "scan_right"}:
+        return ""
+
+    clearance = getattr(state, "lane_clearance_mm", {}) or {}
+    if not isinstance(clearance, dict):
+        return ""
+
+    left = spoken_distance(clearance.get("left"))
+    right = spoken_distance(clearance.get("right"))
+    if path == "go_left":
+        return f"Left clearance {left}."
+    if path == "go_right":
+        return f"Right clearance {right}."
+    return f"Left clearance {left}. Right clearance {right}."
+
+
+def spoken_distance(distance_mm: object) -> str:
+    """Format a millimetre value for short spoken guidance."""
+
+    if not isinstance(distance_mm, (int, float)):
+        return "uncertain"
+    return f"{distance_mm / 1000:.1f} metres"
+
+
+def distance_bucket(distance_mm: object) -> str:
+    """Coarsen distance changes so tiny depth noise does not create speech spam."""
+
+    if not isinstance(distance_mm, (int, float)):
+        return "unknown"
+    return str(int(distance_mm // 500))
 
 
 def is_description_request(message: dict[str, object]) -> bool:

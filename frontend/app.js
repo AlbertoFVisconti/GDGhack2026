@@ -1,4 +1,9 @@
 const els = {
+  videoStream: document.getElementById("videoStream"),
+  depthMode: document.getElementById("depthMode"),
+  rgbMode: document.getElementById("rgbMode"),
+  viewerModeTitle: document.getElementById("viewerModeTitle"),
+  viewerModeHelp: document.getElementById("viewerModeHelp"),
   statusDot: document.getElementById("statusDot"),
   pipelineStatus: document.getElementById("pipelineStatus"),
   path: document.getElementById("path"),
@@ -25,6 +30,9 @@ const els = {
 
 const ctx = els.cloud.getContext("2d");
 let latestData = null;
+let activeStream = "depth";
+let lastCloudCssWidth = 0;
+let lastCloudCssHeight = 0;
 
 function formatMm(value) {
   if (value === null || value === undefined) return "--";
@@ -108,11 +116,33 @@ function updateTtsEvents(events) {
 function updateViewerStats(viewer, pointCount) {
   if (!viewer) return;
   els.viewerFps.textContent = `${viewer.stream_fps} FPS`;
-  els.viewerResolution.textContent = `${viewer.frame_width} x ${viewer.frame_height}`;
+  const label = activeStream === "rgb" ? "RGB" : "Depth";
+  const ready = activeStream === "rgb" ? viewer.rgb_ready : viewer.depth_ready;
+  els.viewerResolution.textContent = ready
+    ? `${label} ${viewer.frame_width} x ${viewer.frame_height}`
+    : `${label} waiting`;
   els.viewerPoints.textContent = `${pointCount} / ${viewer.point_sample_limit} pts`;
 }
 
+function setStreamMode(mode) {
+  if (mode === activeStream) return;
+  activeStream = mode;
+  const nextStreamUrl = `/stream/${mode}.mjpg?t=${Date.now()}`;
+  els.videoStream.src = nextStreamUrl;
+  els.depthMode.classList.toggle("active", mode === "depth");
+  els.rgbMode.classList.toggle("active", mode === "rgb");
+  els.viewerModeTitle.textContent = mode === "depth" ? "Depth Viewer" : "RGB Viewer";
+  els.viewerModeHelp.textContent =
+    mode === "depth"
+      ? "Warm colors are closer. White dividers split left, center, and right path lanes."
+      : "Live RGB view from the center camera with YOLO boxes and navigation overlays.";
+  if (latestData?.viewer) {
+    updateViewerStats(latestData.viewer, latestData.state?.sample_points?.length || 0);
+  }
+}
+
 function drawCloud(points, thresholds, path = "") {
+  resizeCloudCanvas();
   const w = els.cloud.width;
   const h = els.cloud.height;
   const maxRange = (thresholds?.max_range_mm || 3500) / 1000;
@@ -173,6 +203,16 @@ function drawCloud(points, thresholds, path = "") {
   ctx.fillText("RIGHT", w - 88, 24);
   ctx.fillStyle = path.includes("forward") ? "#49d17d" : "#eef4f5";
   ctx.fillText("FORWARD", originX - 28, 24);
+}
+
+function resizeCloudCanvas() {
+  const width = Math.max(320, Math.floor(els.cloud.clientWidth));
+  const height = Math.max(260, Math.floor(els.cloud.clientHeight));
+  if (width === lastCloudCssWidth && height === lastCloudCssHeight) return;
+  lastCloudCssWidth = width;
+  lastCloudCssHeight = height;
+  els.cloud.width = width;
+  els.cloud.height = height;
 }
 
 function drawSuggestedPath(originX, originY, scale, maxRange, laneTan, halfTan, path) {
@@ -266,4 +306,6 @@ function animateRadar() {
 
 poll();
 animateRadar();
+els.depthMode.addEventListener("click", () => setStreamMode("depth"));
+els.rgbMode.addEventListener("click", () => setStreamMode("rgb"));
 setInterval(poll, 250);

@@ -141,10 +141,12 @@ _state_lock = threading.Lock()
 _latest_state: "NavigationState | None" = None
 _latest_scene_detections: list["ObjectDetection"] = []
 _latest_frame: bytes | None = None
+_latest_rgb_frame: bytes | None = None
 _pipeline_status = "starting"
 _pipeline_error: str | None = None
 _cv2: Any | None = None
 _tts_events: list[dict[str, object]] = []
+_last_runtime_log_at = 0.0
 
 
 def env_int(name: str, default: int, minimum: int, maximum: int) -> int:
@@ -213,6 +215,20 @@ class ObjectDetection:
 
 
 @dataclass(frozen=True)
+class SpaceEstimate:
+    """Coarse estimate of surrounding space shape from the point cloud."""
+
+    kind: str
+    width_m: float | None
+    depth_m: float | None
+    left_edge_m: float | None
+    right_edge_m: float | None
+    confidence: float
+    wall_confidence: float
+    description: str
+
+
+@dataclass(frozen=True)
 class NavigationState:
     """Navigation result derived from one point-cloud frame."""
 
@@ -225,6 +241,7 @@ class NavigationState:
     reason: str
     sample_points: list[list[float]]
     object_detections: list[ObjectDetection]
+    space: SpaceEstimate
     timestamp: float
 
 
@@ -260,12 +277,13 @@ def describe_surroundings() -> str:
         else "an unknown distance"
     )
     path = state.recommended_path.replace("_", " ")
+    space = state.space.description
     if scene_detections:
-        return f"I see {describe_detections(scene_detections[:5])}. The current recommendation is {path}."
+        return f"I see {describe_detections(scene_detections[:5])}. The space looks like {space}. The current recommendation is {path}."
     if state.object_detections:
-        return f"I see {describe_detections(state.object_detections[:3])}. The current recommendation is {path}."
+        return f"I see {describe_detections(state.object_detections[:3])}. The space looks like {space}. The current recommendation is {path}."
 
-    return f"Navigation view active. The current recommendation is {path}. The nearest center obstacle is about {nearest} away."
+    return f"Navigation view active. The space looks like {space}. The current recommendation is {path}. The nearest center obstacle is about {nearest} away."
 
 
 def describe_detections(detections: list[ObjectDetection]) -> str:
@@ -368,6 +386,7 @@ class SearchRouteAdvisor:
             reason=f"blocked ahead; turn {self._turn_direction} slowly to search for an exit route",
             sample_points=state.sample_points,
             object_detections=state.object_detections,
+            space=state.space,
             timestamp=state.timestamp,
         )
 
@@ -492,6 +511,7 @@ def create_pipeline() -> tuple[dai.Pipeline, dict[str, Any]]:
     mono_right = pipeline.create(dai.node.Camera).build(RIGHT_STEREO_SOCKET)
     stereo = pipeline.create(dai.node.StereoDepth)
     point_cloud = pipeline.create(dai.node.PointCloud)
+    rgb_output = color.requestOutput(FRAME_SIZE)
     yolo = pipeline.create(dai.node.DetectionNetwork).build(color, dai.NNModelDescription(YOLO_MODEL))
 
     mono_left.requestOutput(STEREO_SIZE, type=dai.ImgFrame.Type.GRAY8).link(stereo.left)
@@ -511,6 +531,7 @@ def create_pipeline() -> tuple[dai.Pipeline, dict[str, Any]]:
         "points": point_cloud.outputPointCloud.createOutputQueue(),
         "depth": stereo.depth.createOutputQueue(),
         "yolo": yolo.out.createOutputQueue(),
+        "rgb": rgb_output.createOutputQueue(),
     }
     return pipeline, queues
 
@@ -576,16 +597,19 @@ def choose_path(clearance: dict[str, int | None]) -> tuple[str, str]:
     if center >= OBSTACLE_DISTANCE_MM:
         return "forward_slow", "object ahead but outside obstacle threshold"
 
+    if (left is None or left < CAUTION_DISTANCE_MM) and (right is None or right < CAUTION_DISTANCE_MM):
+        return "stop", "broad surface or wall ahead; no side lane is safely open"
+
     side_options = {
         lane: distance
         for lane, distance in {"left": left, "right": right}.items()
-        if distance is not None and distance > center + 250
+        if distance is not None and distance >= CAUTION_DISTANCE_MM and distance > center + 500
     }
     if not side_options:
-        return "stop", "obstacle ahead and no safer side lane found"
+        return "stop", "object ahead and no safer side lane found"
 
     best_lane = max(side_options, key=lambda lane: side_options[lane] or 0)
-    return f"go_{best_lane}", f"obstacle ahead; {best_lane} lane has more clearance"
+    return f"go_{best_lane}", f"object ahead; {best_lane} lane has more clearance"
 
 
 def sample_points(points: np.ndarray, max_points: int = POINT_SAMPLE_LIMIT) -> list[list[float]]:
@@ -599,6 +623,145 @@ def sample_points(points: np.ndarray, max_points: int = POINT_SAMPLE_LIMIT) -> l
     sampled[:, 0] = np.round(sampled[:, 0] / 1000, 3)
     sampled[:, 1] = np.round(sampled[:, 1] / 1000, 3)
     return sampled.tolist()
+
+
+def estimate_space(points: np.ndarray, clearance: dict[str, int | None]) -> SpaceEstimate:
+    """Estimate whether the current geometry looks open, narrow, corridor-like, or blocked."""
+
+    if points.shape[0] < MIN_LANE_POINTS:
+        return SpaceEstimate(
+            kind="unknown",
+            width_m=None,
+            depth_m=None,
+            left_edge_m=None,
+            right_edge_m=None,
+            confidence=0.0,
+            wall_confidence=0.0,
+            description="space shape uncertain",
+        )
+
+    near_band = points[(points[:, 2] >= MIN_RANGE_MM) & (points[:, 2] <= MAX_NAVIGATION_RANGE_MM)]
+    if near_band.shape[0] < MIN_LANE_POINTS:
+        near_band = points
+
+    left_edge = float(np.percentile(near_band[:, 0], 5)) / 1000
+    right_edge = float(np.percentile(near_band[:, 0], 95)) / 1000
+    width = max(0.0, right_edge - left_edge)
+    depth = float(np.percentile(near_band[:, 2], 90)) / 1000
+    center = clearance.get("center") or 0
+    left = clearance.get("left") or 0
+    right = clearance.get("right") or 0
+    wall_confidence = estimate_wall_confidence(near_band, clearance)
+
+    if wall_confidence >= 0.68:
+        kind = "wall"
+        description = f"wall ahead; visible span about {width:.1f} metres wide"
+    elif center < OBSTACLE_DISTANCE_MM:
+        kind = "blocked_or_near_wall"
+        description = f"blocked ahead; visible space about {width:.1f} metres wide"
+    elif width < 1.2:
+        kind = "narrow_passage"
+        description = f"narrow passage; visible width about {width:.1f} metres"
+    elif left >= CAUTION_DISTANCE_MM and right >= CAUTION_DISTANCE_MM and center >= CAUTION_DISTANCE_MM:
+        kind = "open_area"
+        description = f"open area; visible space about {width:.1f} metres wide"
+    elif abs(left - right) < 450 and center >= CAUTION_DISTANCE_MM and width < 2.6:
+        kind = "corridor_like"
+        description = f"corridor-like space; visible width about {width:.1f} metres"
+    else:
+        kind = "partly_open"
+        description = f"partly open space; visible width about {width:.1f} metres"
+
+    confidence = round(min(1.0, near_band.shape[0] / max(MIN_LANE_POINTS * 6, 1)), 2)
+    return SpaceEstimate(
+        kind=kind,
+        width_m=round(width, 2),
+        depth_m=round(depth, 2),
+        left_edge_m=round(left_edge, 2),
+        right_edge_m=round(right_edge, 2),
+        confidence=confidence,
+        wall_confidence=wall_confidence,
+        description=description,
+    )
+
+
+def estimate_wall_confidence(points: np.ndarray, clearance: dict[str, int | None]) -> float:
+    """Estimate whether near point-cloud geometry is a broad flat wall."""
+
+    center = clearance.get("center")
+    if center is None or center >= CAUTION_DISTANCE_MM or points.shape[0] < MIN_LANE_POINTS:
+        return 0.0
+
+    front = points[np.abs(points[:, 2] - center) <= 280]
+    if front.shape[0] < MIN_LANE_POINTS:
+        return 0.0
+
+    front_width = (float(np.percentile(front[:, 0], 95)) - float(np.percentile(front[:, 0], 5))) / 1000
+    z_iqr = float(np.percentile(front[:, 2], 75) - np.percentile(front[:, 2], 25))
+    density = min(1.0, front.shape[0] / max(MIN_LANE_POINTS * 4, 1))
+    width_score = min(1.0, front_width / 1.4)
+    flatness_score = max(0.0, 1.0 - z_iqr / 420)
+    side_block_score = 0.0
+    left = clearance.get("left")
+    right = clearance.get("right")
+    if (left is None or left < CAUTION_DISTANCE_MM) and (right is None or right < CAUTION_DISTANCE_MM):
+        side_block_score = 1.0
+
+    confidence = (width_score * 0.4) + (flatness_score * 0.35) + (density * 0.15) + (side_block_score * 0.1)
+    return round(max(0.0, min(1.0, confidence)), 2)
+
+
+def clearance_text(clearance_mm: int | None) -> str:
+    """Format a lane clearance value for guidance text."""
+
+    if clearance_mm is None:
+        return "uncertain"
+    return f"{clearance_mm / 1000:.1f} metres"
+
+
+def clearance_guidance(clearance: dict[str, int | None], space: SpaceEstimate) -> str:
+    """Describe usable side clearance so turns do not drift into nearby walls."""
+
+    left = clearance_text(clearance.get("left"))
+    right = clearance_text(clearance.get("right"))
+    return f"left clearance {left}; right clearance {right}"
+
+
+def object_name(detection: ObjectDetection | None) -> str:
+    """Return the recognized object name or a broad-surface fallback."""
+
+    if detection is not None:
+        return detection.label
+    return "object"
+
+
+def navigation_reason(
+    base_reason: str,
+    space: SpaceEstimate,
+    clearance: dict[str, int | None],
+    nearest_object: ObjectDetection | None,
+) -> str:
+    """Build user-facing guidance text from geometry and optional YOLO label."""
+
+    name = object_name(nearest_object)
+    reason = base_reason.replace("object", name).replace("obstacle", name)
+    space_description = space.description
+    if nearest_object is not None and space.kind in {"blocked_or_near_wall", "wall"}:
+        space_description = (
+            f"visible space about {space.width_m:.1f} metres wide"
+            if space.width_m is not None
+            else "visible space width uncertain"
+        )
+    if space.kind == "wall" and nearest_object is None:
+        reason = "wall ahead"
+        space_description = (
+            f"visible span about {space.width_m:.1f} metres wide"
+            if space.width_m is not None
+            else "visible wall span uncertain"
+        )
+    elif space.kind == "blocked_or_near_wall" and nearest_object is None:
+        reason = reason.replace("object", "wall or broad surface").replace("broad surface or wall", "wall or broad surface")
+    return f"{reason}; {space_description}; {clearance_guidance(clearance, space)}"
 
 
 def detection_label(label_index: int) -> str:
@@ -702,11 +865,12 @@ def analyze_point_cloud(points: np.ndarray, object_detections: list[ObjectDetect
     recommended_path, reason = choose_path(clearance)
     center_clearance = clearance["center"]
     detected = center_clearance is not None and center_clearance < OBSTACLE_DISTANCE_MM
-    populated_lanes = sum(distance is not None for distance in clearance.values())
-    confidence = round(populated_lanes / len(clearance), 2)
+    space = estimate_space(filtered, clearance)
     detected_objects = object_detections or []
     nearest_object = next((item for item in detected_objects if item.distance_mm is not None), None)
     label = nearest_object.label if nearest_object is not None else OBSTACLE_LABEL
+    reason = navigation_reason(reason, space, clearance, nearest_object)
+    confidence = decision_confidence(recommended_path, clearance, space)
 
     return NavigationState(
         label=label,
@@ -718,8 +882,60 @@ def analyze_point_cloud(points: np.ndarray, object_detections: list[ObjectDetect
         reason=reason,
         sample_points=sample_points(filtered),
         object_detections=detected_objects,
+        space=space,
         timestamp=time.time(),
     )
+
+
+def decision_confidence(
+    recommended_path: str,
+    clearance: dict[str, int | None],
+    space: SpaceEstimate,
+) -> float:
+    """Estimate how reliable the current navigation recommendation is."""
+
+    center = clearance.get("center")
+    left = clearance.get("left")
+    right = clearance.get("right")
+    known_lanes = sum(value is not None for value in (left, center, right))
+    lane_quality = known_lanes / 3
+    if center is None:
+        return round(0.2 + lane_quality * 0.25, 2)
+
+    if recommended_path == "forward":
+        distance_margin = normalized_margin(center, CAUTION_DISTANCE_MM, MAX_NAVIGATION_RANGE_MM)
+        return round(0.58 + distance_margin * 0.3 + lane_quality * 0.08, 2)
+
+    if recommended_path == "forward_slow":
+        distance_margin = normalized_margin(center, OBSTACLE_DISTANCE_MM, CAUTION_DISTANCE_MM)
+        return round(0.48 + distance_margin * 0.27 + lane_quality * 0.08, 2)
+
+    if recommended_path == "stop":
+        if space.kind == "wall":
+            return round(0.5 + space.wall_confidence * 0.43, 2)
+        blocked_sides = sum(value is not None and value < CAUTION_DISTANCE_MM for value in (left, right))
+        return round(0.42 + lane_quality * 0.18 + blocked_sides * 0.12, 2)
+
+    if recommended_path in {"scan_left", "scan_right"}:
+        return round(0.58 + space.wall_confidence * 0.25 + lane_quality * 0.08, 2)
+
+    if recommended_path in {"go_left", "go_right"}:
+        side = left if recommended_path == "go_left" else right
+        if side is None:
+            return round(0.35 + lane_quality * 0.15, 2)
+        route_margin = normalized_margin(side - center, 500, MAX_NAVIGATION_RANGE_MM)
+        side_distance = normalized_margin(side, CAUTION_DISTANCE_MM, MAX_NAVIGATION_RANGE_MM)
+        return round(0.48 + route_margin * 0.24 + side_distance * 0.14 + lane_quality * 0.08, 2)
+
+    return round(0.35 + lane_quality * 0.25, 2)
+
+
+def normalized_margin(value: int | float, low: int | float, high: int | float) -> float:
+    """Scale one confidence component to the 0..1 range."""
+
+    if high <= low:
+        return 0.0
+    return max(0.0, min(1.0, (float(value) - float(low)) / (float(high) - float(low))))
 
 
 def render_depth_frame(depth_frame: np.ndarray, state: NavigationState) -> bytes | None:
@@ -731,9 +947,10 @@ def render_depth_frame(depth_frame: np.ndarray, state: NavigationState) -> bytes
 
     valid = np.where(depth_frame > 0, depth_frame, MAX_NAVIGATION_RANGE_MM)
     clipped = np.clip(valid, MIN_RANGE_MM, MAX_NAVIGATION_RANGE_MM)
-    normalized = ((MAX_NAVIGATION_RANGE_MM - clipped) * 255 / MAX_NAVIGATION_RANGE_MM).astype(np.uint8)
+    scaled = (MAX_NAVIGATION_RANGE_MM - clipped) / max(MAX_NAVIGATION_RANGE_MM - MIN_RANGE_MM, 1)
+    normalized = np.clip((scaled**0.65) * 255, 0, 255).astype(np.uint8)
     resized = cv2.resize(normalized, FRAME_SIZE)
-    frame = cv2.applyColorMap(resized, cv2.COLORMAP_TURBO)
+    frame = cv2.applyColorMap(resized, cv2.COLORMAP_JET)
 
     height, width = frame.shape[:2]
     fov_left_x = int(width * (1 - FOV_FRACTION) / 2)
@@ -756,6 +973,53 @@ def render_depth_frame(depth_frame: np.ndarray, state: NavigationState) -> bytes
     cv2.putText(frame, state.reason, (18, height - 24), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
     draw_object_detections(cv2, frame, state.object_detections)
 
+    success, encoded = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY])
+    return encoded.tobytes() if success else None
+
+
+def render_rgb_frame(rgb_message: Any | None, state: NavigationState) -> bytes | None:
+    """Create a JPEG RGB visualization with the same obstacle overlays."""
+
+    if rgb_message is None:
+        return None
+
+    cv2 = get_cv2()
+    if cv2 is None:
+        return None
+
+    try:
+        frame = rgb_message.getCvFrame()
+    except BaseException as exc:
+        log_json({"event": "rgb_frame_decode_failed", "error": repr(exc), "message_type": type(rgb_message).__name__})
+        return None
+
+    if frame.shape[1::-1] != FRAME_SIZE:
+        frame = cv2.resize(frame, FRAME_SIZE)
+
+    height, width = frame.shape[:2]
+    draw_yolo_path_boundaries(cv2, frame)
+    color = (0, 0, 255) if state.detected else (0, 180, 0)
+    cv2.putText(frame, state.label.upper(), (18, 36), cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2)
+    cv2.putText(frame, state.recommended_path, (18, 72), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
+    cv2.putText(frame, state.reason, (18, height - 24), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+    draw_object_detections(cv2, frame, state.object_detections)
+
+    success, encoded = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY])
+    return encoded.tobytes() if success else None
+
+
+def render_waiting_frame(label: str, detail: str) -> bytes | None:
+    """Create a small JPEG placeholder for a stream that has no frames yet."""
+
+    cv2 = get_cv2()
+    if cv2 is None:
+        return None
+
+    frame = np.zeros((FRAME_SIZE[1], FRAME_SIZE[0], 3), dtype=np.uint8)
+    frame[:] = (18, 24, 28)
+    cv2.putText(frame, label, (28, 52), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (79, 184, 255), 2)
+    cv2.putText(frame, detail, (28, 92), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (238, 244, 245), 1)
+    cv2.putText(frame, "Check /api/status viewer.rgb_ready and app logs.", (28, 128), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (156, 173, 178), 1)
     success, encoded = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY])
     return encoded.tobytes() if success else None
 
@@ -863,17 +1127,56 @@ def get_cv2() -> Any | None:
     return _cv2
 
 
-def update_runtime_state(state: NavigationState, frame: bytes | None) -> None:
+def update_runtime_state(state: NavigationState, depth_frame: bytes | None, rgb_frame: bytes | None) -> None:
     """Store the latest navigation and visualization outputs."""
 
-    global _latest_frame, _latest_state
+    global _last_runtime_log_at, _latest_frame, _latest_rgb_frame, _latest_state
     with _state_lock:
         _latest_state = state
-        if frame is not None:
-            _latest_frame = frame
-    announce_nearby_objects(state)
+        if depth_frame is not None:
+            _latest_frame = depth_frame
+        if rgb_frame is not None:
+            _latest_rgb_frame = rgb_frame
+        depth_ready = _latest_frame is not None
+        rgb_ready = _latest_rgb_frame is not None
     tts_notifier.maybe_describe(state)
-    log_json(asdict(state))
+    now = time.time()
+    if now - _last_runtime_log_at >= 2.0:
+        _last_runtime_log_at = now
+        log_json(navigation_log_payload(state, depth_ready, rgb_ready))
+
+
+def navigation_log_payload(state: NavigationState, depth_ready: bool, rgb_ready: bool) -> dict[str, object]:
+    """Build compact runtime logs without dumping point-cloud vectors."""
+
+    return {
+        "event": "navigation_state",
+        "path": state.recommended_path,
+        "detected": state.detected,
+        "nearest_mm": state.nearest_obstacle_mm,
+        "confidence": state.confidence,
+        "reason": state.reason,
+        "lane_clearance_mm": state.lane_clearance_mm,
+        "objects": [
+            {
+                "label": detection.label,
+                "distance_mm": detection.distance_mm,
+                "confidence": detection.confidence,
+                "side": detection.lateral_position,
+            }
+            for detection in state.object_detections[:4]
+        ],
+        "space": {
+            "kind": state.space.kind,
+            "width_m": state.space.width_m,
+            "wall_confidence": state.space.wall_confidence,
+        },
+        "frames": {
+            "depth_ready": depth_ready,
+            "rgb_ready": rgb_ready,
+        },
+        "sample_points": len(state.sample_points),
+    }
 
 
 def set_pipeline_status(status: str, error: str | None = None) -> None:
@@ -900,6 +1203,7 @@ def pipeline_worker() -> None:
             while pipeline.isRunning() and not _should_stop:
                 point_message = queues["points"].get()
                 depth_message = queues["depth"].tryGet()
+                rgb_message = queues["rgb"].tryGet()
                 yolo_message = queues["yolo"].tryGet()
                 depth_frame = None
                 if isinstance(depth_message, dai.ImgFrame):
@@ -912,11 +1216,12 @@ def pipeline_worker() -> None:
                     analyze_point_cloud(points_to_array(point_message), navigation_objects)
                 )
 
-                frame = None
+                rendered_depth = None
                 if depth_frame is not None:
-                    frame = render_depth_frame(depth_frame, state)
+                    rendered_depth = render_depth_frame(depth_frame, state)
+                rendered_rgb = render_rgb_frame(rgb_message, state)
 
-                update_runtime_state(state, frame)
+                update_runtime_state(state, rendered_depth, rendered_rgb)
 
             set_pipeline_status("stopping")
             pipeline.stop()
@@ -933,6 +1238,8 @@ def status_payload() -> dict[str, object]:
         tts_events = list(_tts_events[-12:])
         pipeline_status = _pipeline_status
         pipeline_error = _pipeline_error
+        depth_ready = _latest_frame is not None
+        rgb_ready = _latest_rgb_frame is not None
 
     return {
         "pipeline_status": pipeline_status,
@@ -953,6 +1260,9 @@ def status_payload() -> dict[str, object]:
             "stereo_width": STEREO_SIZE[0],
             "stereo_height": STEREO_SIZE[1],
             "stream_fps": STREAM_FPS,
+            "stream_modes": ["depth", "rgb"],
+            "depth_ready": depth_ready,
+            "rgb_ready": rgb_ready,
             "jpeg_quality": JPEG_QUALITY,
             "point_sample_limit": POINT_SAMPLE_LIMIT,
             "wall_stop_frames": WALL_STOP_FRAMES,
@@ -964,11 +1274,19 @@ def status_payload() -> dict[str, object]:
     }
 
 
-def latest_frame() -> bytes | None:
+def latest_frame(stream_name: str) -> bytes | None:
     """Return the most recent rendered JPEG frame for MJPEG streaming."""
 
     with _state_lock:
-        return _latest_frame
+        if stream_name == "rgb":
+            frame = _latest_rgb_frame
+            fallback = "Waiting for RGB camera frames"
+        else:
+            frame = _latest_frame
+            fallback = "Waiting for depth frames"
+    if frame is not None:
+        return frame
+    return render_waiting_frame(f"{stream_name.upper()} stream waiting", fallback)
 
 
 def should_stop() -> bool:
