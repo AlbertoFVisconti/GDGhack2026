@@ -4,3 +4,4 @@ AGENTS.md
 com-*
 pipeline*
 .oakignore
+__pycache__/
