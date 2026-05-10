@@ -1,4 +1,4 @@
-# GDGhack2026 OAK Pathfinder
+# unblAInder - GDGAIHack 2026
 
 Standalone navigation prototype for the Luxonis OAK 4 D Pro. The app uses stereo depth, point-cloud geometry, YOLO object detection, and WebSocket speech messages to warn a visually impaired user about obstacles and suggest a simple path direction.
 
