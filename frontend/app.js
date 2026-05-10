@@ -74,9 +74,9 @@ function updateTtsEvents(events) {
     .slice()
     .reverse()
     .map((event) => {
-      const label = event.type === "camera_status" ? "CameraStatus" : "DescribeInput";
+      const label = event.type === "camera_status" ? "Camera status" : "Description message";
       const payload = event.payload || {};
-      const message = payload.hint || `connected: ${payload.connected}`;
+      const message = payload.text || `connected: ${payload.cameraConnected}`;
       const time = new Date((event.timestamp || 0) * 1000).toLocaleTimeString();
       return `<div class="tts-event"><strong>${label}</strong><span>${message}</span><span>${time}</span></div>`;
     })

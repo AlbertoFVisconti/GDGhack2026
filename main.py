@@ -5,12 +5,11 @@ from __future__ import annotations
 
 import json
 import os
+import queue
 import signal
 import threading
 import time
 import traceback
-import urllib.error
-import urllib.request
 from dataclasses import asdict, dataclass
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -89,8 +88,7 @@ FRAME_SIZE: Final = (
 STREAM_FPS: Final = env_int("DEBUG_STREAM_FPS", DEFAULT_STREAM_FPS, 1, 30)
 JPEG_QUALITY: Final = env_int("DEBUG_JPEG_QUALITY", DEFAULT_JPEG_QUALITY, 35, 95)
 POINT_SAMPLE_LIMIT: Final = env_int("POINT_SAMPLE_LIMIT", DEFAULT_POINT_SAMPLE_LIMIT, 150, 5_000)
-TTS_CAMERA_STATUS_URL: Final = env_url("TTS_CAMERA_STATUS_URL")
-TTS_DESCRIBE_URL: Final = env_url("TTS_DESCRIBE_URL")
+VISION_WS_URL: Final = env_url("VISION_WS_URL")
 TTS_MIN_INTERVAL_SECONDS: Final = env_float(
     "TTS_MIN_INTERVAL_SECONDS", DEFAULT_TTS_MIN_INTERVAL_SECONDS, 1.0, 30.0
 )
@@ -114,19 +112,17 @@ class NavigationState:
 
 
 class TtsNotifier:
-    """Notify a text-to-speech service when camera and guidance state changes."""
+    """Notify the vision frontend WebSocket when guidance state changes."""
 
     def __init__(
         self,
-        camera_status_url: str | None,
-        describe_url: str | None,
+        vision_ws_url: str | None,
         min_interval_seconds: float,
         stable_frames: int,
     ) -> None:
-        """Create a notifier for the generated TTS API client endpoints."""
+        """Create a notifier for the frontend /api/camera WebSocket."""
 
-        self.camera_status_url = camera_status_url
-        self.describe_url = describe_url
+        self.vision_ws_url = vision_ws_url
         self.min_interval_seconds = min_interval_seconds
         self.stable_frames = stable_frames
         self._camera_connected_sent = False
@@ -134,25 +130,23 @@ class TtsNotifier:
         self._candidate_count = 0
         self._last_spoken_path: str | None = None
         self._last_spoken_at = 0.0
-
-    def configure_dummy_urls(self, port: int) -> None:
-        """Use local dummy endpoints when no external TTS URLs are configured."""
-
-        if self.camera_status_url is None:
-            self.camera_status_url = f"http://127.0.0.1:{port}/dummy/camera-status"
-        if self.describe_url is None:
-            self.describe_url = f"http://127.0.0.1:{port}/dummy/describe"
+        self._ws: Any | None = None
+        self._ws_lock = threading.Lock()
+        self._listener_started = False
+        self._outbox: "queue.Queue[dict[str, object]]" = queue.Queue()
 
     def notify_camera_connected(self) -> None:
-        """Send CameraStatus once after the camera pipeline is running."""
+        """Send camera connection state once after the pipeline is running."""
 
         if self._camera_connected_sent:
             return
         self._camera_connected_sent = True
-        self._post_json(self.camera_status_url, {"connected": True}, "camera_status")
+        payload = {"type": "status", "cameraConnected": True}
+        record_tts_event("camera_status", payload)
+        self.send(payload)
 
     def maybe_describe(self, state: NavigationState) -> None:
-        """Send a DescribeInput hint only after a stable recommendation change."""
+        """Send a description hint only after a stable recommendation change."""
 
         path = state.recommended_path
         if path == self._candidate_path:
@@ -169,30 +163,122 @@ class TtsNotifier:
         if now - self._last_spoken_at < self.min_interval_seconds:
             return
 
-        hint = speech_hint(path)
+        text = speech_hint(path)
         self._last_spoken_path = path
         self._last_spoken_at = now
-        self._post_json(self.describe_url, {"hint": hint}, "describe")
+        payload = {"type": "description", "text": text}
+        record_tts_event("description", payload)
+        self.send(payload)
 
-    def _post_json(self, url: str | None, payload: dict[str, object], event: str) -> None:
-        """POST a JSON payload to the configured TTS endpoint."""
+    def send(self, payload: dict[str, object]) -> None:
+        """Queue one JSON payload for the /api/camera WebSocket."""
 
-        if not url:
-            log_json({"event": f"tts_{event}_skipped", "payload": payload, "reason": "url_not_configured"})
+        if not self.vision_ws_url:
+            log_json({"event": "vision_ws_skipped", "payload": payload, "reason": "url_not_configured"})
             return
 
-        data = json.dumps(payload).encode("utf-8")
-        request = urllib.request.Request(
-            url,
-            data=data,
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
+        self._outbox.put(payload)
+        self._start_listener()
+
+    def _start_listener(self) -> None:
+        """Start the persistent WebSocket loop once."""
+
+        if not self.vision_ws_url or self._listener_started:
+            return
+        self._listener_started = True
+        thread = threading.Thread(target=self._websocket_loop, daemon=True)
+        thread.start()
+
+    def _websocket_loop(self) -> None:
+        """Keep the WebSocket open for outgoing and incoming messages."""
+
+        while not _should_stop:
+            ws = self._ensure_websocket()
+            if ws is None:
+                time.sleep(2.0)
+                continue
+
+            self._drain_outbox(ws)
+            try:
+                ws.settimeout(0.25)
+                incoming = ws.recv()
+            except TimeoutError:
+                continue
+            except BaseException as exc:
+                if is_websocket_timeout(exc):
+                    continue
+                log_json({"event": "vision_ws_receive_failed", "error": repr(exc)})
+                with self._ws_lock:
+                    self._close_websocket_locked()
+                time.sleep(1.0)
+                continue
+
+            if incoming:
+                self._handle_incoming_message(incoming)
+
+    def _drain_outbox(self, ws: Any) -> None:
+        """Send all queued messages on the current WebSocket connection."""
+
+        while not self._outbox.empty():
+            payload = self._outbox.get()
+            try:
+                ws.send(json.dumps(payload, separators=(",", ":")))
+                log_json({"event": "vision_ws_sent", "payload": payload})
+            except BaseException as exc:
+                log_json({"event": "vision_ws_failed", "error": repr(exc), "payload": payload})
+                self._outbox.put(payload)
+                with self._ws_lock:
+                    self._close_websocket_locked()
+                return
+
+    def _handle_incoming_message(self, raw_message: object) -> None:
+        """Handle frontend requests sent over the camera WebSocket."""
+
         try:
-            with urllib.request.urlopen(request, timeout=0.35) as response:
-                log_json({"event": f"tts_{event}_sent", "status": response.status, "payload": payload})
-        except (urllib.error.URLError, TimeoutError, OSError) as exc:
-            log_json({"event": f"tts_{event}_failed", "error": repr(exc), "payload": payload})
+            if isinstance(raw_message, bytes):
+                message = json.loads(raw_message.decode("utf-8"))
+            else:
+                message = json.loads(str(raw_message))
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            log_json({"event": "vision_ws_bad_message", "error": repr(exc), "raw": str(raw_message)})
+            return
+
+        log_json({"event": "vision_ws_received", "payload": message})
+        if is_description_request(message):
+            payload = {"type": "description", "text": describe_surroundings()}
+            record_tts_event("description", payload)
+            self._outbox.put(payload)
+
+    def _ensure_websocket(self) -> Any | None:
+        """Open the WebSocket once and reuse it for later messages."""
+
+        if self._ws is not None and self._ws.connected:
+            return self._ws
+
+        with self._ws_lock:
+            if self._ws is not None and self._ws.connected:
+                return self._ws
+            try:
+                import websocket
+
+                self._ws = websocket.create_connection(self.vision_ws_url, timeout=2.0)
+                log_json({"event": "vision_ws_connected", "url": self.vision_ws_url})
+                return self._ws
+            except BaseException as exc:
+                log_json({"event": "vision_ws_connect_failed", "error": repr(exc), "url": self.vision_ws_url})
+                self._ws = None
+                return None
+
+    def _close_websocket_locked(self) -> None:
+        """Close the current WebSocket connection while holding the lock."""
+
+        if self._ws is None:
+            return
+        try:
+            self._ws.close()
+        except BaseException:
+            pass
+        self._ws = None
 
 
 def speech_hint(recommended_path: str) -> str:
@@ -209,6 +295,55 @@ def speech_hint(recommended_path: str) -> str:
         "scan_right": "Blocked ahead. Turn right slowly and scan for an opening.",
     }
     return hints.get(recommended_path, recommended_path.replace("_", " "))
+
+
+def record_tts_event(event_type: str, payload: dict[str, object]) -> None:
+    """Record a would-send TTS payload for the local viewer."""
+
+    event = {
+        "type": event_type,
+        "payload": payload,
+        "timestamp": time.time(),
+    }
+    with _state_lock:
+        _tts_events.append(event)
+        del _tts_events[:-30]
+    log_json({"event": "tts_event_recorded", **event})
+
+
+def is_description_request(message: dict[str, object]) -> bool:
+    """Return whether an incoming WebSocket message requests scene description."""
+
+    message_type = str(message.get("type", "")).lower()
+    action = str(message.get("action", "")).lower()
+    return message_type in {"describe", "description_request", "request_description"} or action in {
+        "describe",
+        "request_description",
+    }
+
+
+def is_websocket_timeout(exc: BaseException) -> bool:
+    """Return whether a WebSocket receive exception is just an idle timeout."""
+
+    return type(exc).__name__ in {"WebSocketTimeoutException", "TimeoutError", "TimeoutException"}
+
+
+def describe_surroundings() -> str:
+    """Return a placeholder scene description until object recognition is wired in."""
+
+    with _state_lock:
+        state = _latest_state
+
+    if state is None:
+        return "The camera is starting. I do not have a scene description yet."
+
+    nearest = (
+        f"{state.nearest_obstacle_mm / 1000:.1f} metres"
+        if state.nearest_obstacle_mm is not None
+        else "an unknown distance"
+    )
+    path = state.recommended_path.replace("_", " ")
+    return f"Navigation view active. The current recommendation is {path}. The nearest center obstacle is about {nearest} away."
 
 
 class SearchRouteAdvisor:
@@ -253,8 +388,7 @@ class SearchRouteAdvisor:
 
 
 tts_notifier = TtsNotifier(
-    TTS_CAMERA_STATUS_URL,
-    TTS_DESCRIBE_URL,
+    VISION_WS_URL,
     TTS_MIN_INTERVAL_SECONDS,
     TTS_STABLE_FRAMES,
 )
@@ -444,7 +578,6 @@ def render_depth_frame(depth_frame: np.ndarray, state: NavigationState) -> bytes
     cv2.line(frame, (fov_right_x, 0), (fov_right_x, height), (255, 255, 255), 1)
     cv2.line(frame, (left_x, 0), (left_x, height), (255, 255, 255), 1)
     cv2.line(frame, (right_x, 0), (right_x, height), (255, 255, 255), 1)
-    draw_suggested_path(cv2, frame, state.recommended_path, fov_left_x, left_x, right_x, fov_right_x)
     cv2.putText(frame, state.label.upper(), (18, 36), cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2)
     cv2.putText(frame, state.recommended_path, (18, 72), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
     cv2.putText(frame, state.reason, (18, height - 24), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
@@ -594,16 +727,6 @@ class FrontendHandler(BaseHTTPRequestHandler):
         else:
             self.send_error(HTTPStatus.NOT_FOUND)
 
-    def do_POST(self) -> None:
-        """Route dummy TTS POST requests."""
-
-        if self.path == "/dummy/camera-status":
-            self._serve_dummy_tts_post("camera_status")
-        elif self.path == "/dummy/describe":
-            self._serve_dummy_tts_post("describe")
-        else:
-            self.send_error(HTTPStatus.NOT_FOUND)
-
     def log_message(self, _format: str, *_args: object) -> None:
         """Suppress default HTTP request logs."""
 
@@ -672,39 +795,11 @@ class FrontendHandler(BaseHTTPRequestHandler):
             self.wfile.write(b"\r\n")
             time.sleep(1 / STREAM_FPS)
 
-    def _serve_dummy_tts_post(self, event_type: str) -> None:
-        """Record a dummy TTS payload so the frontend can display it."""
-
-        content_length = int(self.headers.get("Content-Length", "0"))
-        raw_body = self.rfile.read(content_length) if content_length > 0 else b"{}"
-        try:
-            payload = json.loads(raw_body.decode("utf-8"))
-        except json.JSONDecodeError:
-            payload = {"raw": raw_body.decode("utf-8", errors="replace")}
-
-        event = {
-            "type": event_type,
-            "payload": payload,
-            "timestamp": time.time(),
-        }
-        with _state_lock:
-            _tts_events.append(event)
-            del _tts_events[:-30]
-
-        log_json({"event": "dummy_tts_received", **event})
-        data = json.dumps({"queued": True}, separators=(",", ":")).encode()
-        self.send_response(HTTPStatus.OK)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(data)))
-        self.end_headers()
-        self.wfile.write(data)
-
 
 def serve_frontend() -> None:
     """Start the frontend server and keep it alive until shutdown."""
 
     port = int(os.getenv("OAKAPP_STATIC_FRONTEND_PORT", os.getenv("PORT", "8080")))
-    tts_notifier.configure_dummy_urls(port)
     server = ThreadingHTTPServer(("0.0.0.0", port), FrontendHandler)
     log_json({"event": "frontend_ready", "url": f"http://0.0.0.0:{port}"})
     try:
