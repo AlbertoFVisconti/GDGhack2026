@@ -116,7 +116,7 @@ MIN_LANE_POINTS: Final = 80
 FOV_FRACTION: Final = 0.90
 LANE_ANGLE_TAN: Final = FOV_FRACTION / 6
 FOV_HALF_TAN: Final = FOV_FRACTION / 2
-VERTICAL_LIMIT_MM: Final = 1_200
+VERTICAL_LIMIT_MM: Final = 1_800
 DEFAULT_FRAME_WIDTH: Final = 640
 DEFAULT_FRAME_HEIGHT: Final = 400
 DEFAULT_STREAM_FPS: Final = 18
@@ -126,6 +126,8 @@ DEFAULT_TTS_MIN_INTERVAL_SECONDS: Final = 4.0
 DEFAULT_TTS_STABLE_FRAMES: Final = 3
 DEFAULT_WALL_STOP_FRAMES: Final = 16
 DEFAULT_YOLO_CONFIDENCE: Final = 0.35
+DEFAULT_YOLO_CENTER_FRACTION: Final = 0.55
+DEFAULT_OBJECT_NOTIFY_COOLDOWN_SECONDS: Final = 5.0
 OBJECT_DEPTH_PERCENTILE: Final = 50
 OBJECT_MOTION_WINDOW: Final = 6
 OBJECT_MOTION_MM_PER_SECOND: Final = 180
@@ -135,6 +137,7 @@ FRONTEND_DIR: Final = Path(__file__).resolve().parent / "frontend"
 _should_stop = False
 _state_lock = threading.Lock()
 _latest_state: "NavigationState | None" = None
+_latest_scene_detections: list["ObjectDetection"] = []
 _latest_frame: bytes | None = None
 _pipeline_status = "starting"
 _pipeline_error: str | None = None
@@ -183,6 +186,11 @@ TTS_MIN_INTERVAL_SECONDS: Final = env_float(
 TTS_STABLE_FRAMES: Final = env_int("TTS_STABLE_FRAMES", DEFAULT_TTS_STABLE_FRAMES, 1, 20)
 WALL_STOP_FRAMES: Final = env_int("WALL_STOP_FRAMES", DEFAULT_WALL_STOP_FRAMES, 4, 120)
 YOLO_CONFIDENCE: Final = env_float("YOLO_CONFIDENCE", DEFAULT_YOLO_CONFIDENCE, 0.05, 0.95)
+YOLO_CENTER_FRACTION: Final = env_float("YOLO_CENTER_FRACTION", DEFAULT_YOLO_CENTER_FRACTION, 0.15, 1.0)
+OBJECT_NOTIFY_COOLDOWN_SECONDS: Final = env_float(
+    "OBJECT_NOTIFY_COOLDOWN_SECONDS", DEFAULT_OBJECT_NOTIFY_COOLDOWN_SECONDS, 1.0, 30.0
+)
+OBJECT_TRIGGER_RANGE_MM: Final = env_int("OBJECT_TRIGGER_RANGE_MM", MAX_NAVIGATION_RANGE_MM, 500, 10_000)
 
 
 @dataclass(frozen=True)
@@ -233,9 +241,12 @@ def describe_surroundings() -> str:
 
     with _state_lock:
         state = _latest_state
+        scene_detections = list(_latest_scene_detections)
 
-    if state is None:
+    if state is None and not scene_detections:
         return "The camera is starting. I do not have a scene description yet."
+    if state is None:
+        return f"I see {describe_detections(scene_detections[:5])}."
 
     nearest = (
         f"{state.nearest_obstacle_mm / 1000:.1f} metres"
@@ -243,20 +254,74 @@ def describe_surroundings() -> str:
         else "an unknown distance"
     )
     path = state.recommended_path.replace("_", " ")
+    if scene_detections:
+        return f"I see {describe_detections(scene_detections[:5])}. The current recommendation is {path}."
     if state.object_detections:
-        described = []
-        for detection in state.object_detections[:3]:
-            distance = (
-                f"{detection.distance_mm / 1000:.1f} metres"
-                if detection.distance_mm is not None
-                else "unknown distance"
-            )
-            motion = "" if detection.motion in {"unknown", "stationary"} else f", {detection.motion.replace('_', ' ')}"
-            described.append(f"{detection.label} {detection.lateral_position} at {distance}{motion}")
-        objects = "; ".join(described)
-        return f"I see {objects}. The current recommendation is {path}."
+        return f"I see {describe_detections(state.object_detections[:3])}. The current recommendation is {path}."
 
     return f"Navigation view active. The current recommendation is {path}. The nearest center obstacle is about {nearest} away."
+
+
+def describe_detections(detections: list[ObjectDetection]) -> str:
+    """Format YOLO detections for a spoken scene description."""
+
+    described = []
+    for detection in detections:
+        distance = (
+            f"{detection.distance_mm / 1000:.1f} metres"
+            if detection.distance_mm is not None
+            else "unknown distance"
+        )
+        motion = "" if detection.motion in {"unknown", "stationary"} else f", {detection.motion.replace('_', ' ')}"
+        described.append(f"{detection.label} {detection.lateral_position} at {distance}{motion}")
+    return "; ".join(described)
+
+
+def object_speech_text(detection: ObjectDetection) -> str:
+    """Create a short speech message for one YOLO object detection."""
+
+    distance = (
+        f"{detection.distance_mm / 1000:.1f} metres"
+        if detection.distance_mm is not None
+        else "an unknown distance"
+    )
+    motion = "" if detection.motion in {"unknown", "stationary"} else f", {detection.motion.replace('_', ' ')}"
+    return f"{detection.label} detected {detection.lateral_position}, {distance} away{motion}."
+
+
+def announce_nearby_objects(state: NavigationState) -> None:
+    """Send debounced center-object description messages to the speech frontend."""
+
+    for detection in object_announcement_cooldown.pending_announcements(state.object_detections):
+        payload = {"type": "description", "text": object_speech_text(detection)}
+        record_tts_event("description", payload)
+        tts_notifier.send(payload)
+        log_json(
+            {
+                "event": "object_announcement",
+                "label": detection.label,
+                "distance_mm": detection.distance_mm,
+                "cooldown_seconds": OBJECT_NOTIFY_COOLDOWN_SECONDS,
+                "detection_region": "center",
+            }
+        )
+
+
+def center_frame_detections(detections: list[ObjectDetection]) -> list[ObjectDetection]:
+    """Keep only YOLO detections whose center is in the horizontal navigation band."""
+
+    half_width = YOLO_CENTER_FRACTION / 2
+    left = 0.5 - half_width
+    right = 0.5 + half_width
+    return [detection for detection in detections if left <= detection.center[0] <= right]
+
+
+def store_scene_detections(detections: list[ObjectDetection]) -> None:
+    """Cache full-frame detections for explicit room description requests."""
+
+    with _state_lock:
+        _latest_scene_detections.clear()
+        _latest_scene_detections.extend(detections[:12])
 
 
 class SearchRouteAdvisor:
@@ -350,6 +415,32 @@ class ObjectMotionTracker:
         return f"{detection.label}:{x_bin}"
 
 
+class ObjectAnnouncementCooldown:
+    """Debounce repeated object announcements by label."""
+
+    def __init__(self, cooldown_seconds: float, trigger_range_mm: int) -> None:
+        """Create an object announcement debounce helper."""
+
+        self.cooldown_seconds = cooldown_seconds
+        self.trigger_range_mm = trigger_range_mm
+        self._last_announced_at: dict[str, float] = {}
+
+    def pending_announcements(self, detections: list[ObjectDetection]) -> list[ObjectDetection]:
+        """Return nearby detections that should be announced now."""
+
+        now = time.time()
+        announcements = []
+        for detection in detections:
+            if detection.distance_mm is None or detection.distance_mm > self.trigger_range_mm:
+                continue
+            last_announced_at = self._last_announced_at.get(detection.label, 0.0)
+            if now - last_announced_at < self.cooldown_seconds:
+                continue
+            self._last_announced_at[detection.label] = now
+            announcements.append(detection)
+        return announcements
+
+
 def log_json(payload: dict[str, object]) -> None:
     """Write one structured log line."""
 
@@ -367,6 +458,10 @@ tts_notifier = TtsNotifier(
 )
 search_route_advisor = SearchRouteAdvisor(WALL_STOP_FRAMES)
 object_motion_tracker = ObjectMotionTracker(OBJECT_MOTION_WINDOW, OBJECT_MOTION_MM_PER_SECOND)
+object_announcement_cooldown = ObjectAnnouncementCooldown(
+    OBJECT_NOTIFY_COOLDOWN_SECONDS,
+    OBJECT_TRIGGER_RANGE_MM,
+)
 
 
 def handle_shutdown_signal(_signum: int, _frame: object) -> None:
@@ -390,7 +485,7 @@ def create_pipeline() -> tuple[dai.Pipeline, dict[str, Any]]:
     mono_left.requestOutput(FRAME_SIZE, type=dai.ImgFrame.Type.GRAY8).link(stereo.left)
     mono_right.requestOutput(FRAME_SIZE, type=dai.ImgFrame.Type.GRAY8).link(stereo.right)
 
-    stereo.setDefaultProfilePreset(dai.node.StereoDepth.PresetMode.ROBOTICS)
+    stereo.setDefaultProfilePreset(dai.node.StereoDepth.PresetMode.FAST_DENSITY)
     stereo.setDepthAlign(RGB_SOCKET)
     stereo.setRectification(True)
     stereo.setExtendedDisparity(True)
@@ -753,6 +848,7 @@ def update_runtime_state(state: NavigationState, frame: bytes | None) -> None:
         _latest_state = state
         if frame is not None:
             _latest_frame = frame
+    announce_nearby_objects(state)
     tts_notifier.maybe_describe(state)
     log_json(asdict(state))
 
@@ -786,8 +882,12 @@ def pipeline_worker() -> None:
                 if isinstance(depth_message, dai.ImgFrame):
                     depth_frame = depth_message.getFrame()
 
-                objects = yolo_object_detections(yolo_message, depth_frame)
-                state = search_route_advisor.apply(analyze_point_cloud(points_to_array(point_message), objects))
+                scene_objects = yolo_object_detections(yolo_message, depth_frame)
+                store_scene_detections(scene_objects)
+                navigation_objects = center_frame_detections(scene_objects)
+                state = search_route_advisor.apply(
+                    analyze_point_cloud(points_to_array(point_message), navigation_objects)
+                )
 
                 frame = None
                 if depth_frame is not None:
@@ -831,6 +931,10 @@ def status_payload() -> dict[str, object]:
             "jpeg_quality": JPEG_QUALITY,
             "point_sample_limit": POINT_SAMPLE_LIMIT,
             "wall_stop_frames": WALL_STOP_FRAMES,
+            "object_trigger_range_mm": OBJECT_TRIGGER_RANGE_MM,
+            "object_notify_cooldown_seconds": OBJECT_NOTIFY_COOLDOWN_SECONDS,
+            "yolo_center_fraction": YOLO_CENTER_FRACTION,
+            "vertical_limit_mm": VERTICAL_LIMIT_MM,
         },
     }
 
