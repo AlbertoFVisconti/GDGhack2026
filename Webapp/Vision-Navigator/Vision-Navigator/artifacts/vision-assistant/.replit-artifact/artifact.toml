@@ -1,0 +1,31 @@
+kind = "web"
+previewPath = "/"
+title = "Vision Assistant"
+version = "1.0.0"
+id = "artifacts/vision-assistant"
+router = "path"
+
+[[integratedSkills]]
+name = "react-vite"
+version = "1.0.0"
+
+[[services]]
+name = "web"
+paths = [ "/" ]
+localPort = 24384
+
+[services.development]
+run = "pnpm --filter @workspace/vision-assistant run dev"
+
+[services.production]
+build = [ "pnpm", "--filter", "@workspace/vision-assistant", "run", "build" ]
+publicDir = "artifacts/vision-assistant/dist/public"
+serve = "static"
+
+[[services.production.rewrites]]
+from = "/*"
+to = "/index.html"
+
+[services.env]
+PORT = "24384"
+BASE_PATH = "/"

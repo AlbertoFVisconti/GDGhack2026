@@ -1,0 +1,101 @@
+openapi: 3.1.0
+info:
+  # Do not change the title, if the title changes, the import paths will be broken
+  title: Api
+  version: 0.1.0
+  description: API specification
+servers:
+  - url: /api
+    description: Base API path
+tags:
+  - name: health
+    description: Health operations
+  - name: camera
+    description: Camera vision operations
+paths:
+  /healthz:
+    get:
+      operationId: healthCheck
+      tags: [health]
+      summary: Health check
+      description: Returns server health status
+      responses:
+        "200":
+          description: Healthy
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthStatus"
+  /status:
+    get:
+      operationId: getCameraStatus
+      tags: [camera]
+      summary: Camera connection status
+      description: Returns whether the camera is currently connected
+      responses:
+        "200":
+          description: Status
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CameraStatus"
+  /describe:
+    post:
+      operationId: requestDescription
+      tags: [camera]
+      summary: Request scene description
+      description: Ask the camera to describe the current surroundings
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DescribeInput"
+      responses:
+        "200":
+          description: Request forwarded to camera
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DescribeResult"
+        "503":
+          description: Camera not connected
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+components:
+  schemas:
+    HealthStatus:
+      type: object
+      properties:
+        status:
+          type: string
+      required:
+        - status
+    CameraStatus:
+      type: object
+      properties:
+        connected:
+          type: boolean
+      required:
+        - connected
+    DescribeInput:
+      type: object
+      properties:
+        hint:
+          type: ["string", "null"]
+    DescribeResult:
+      type: object
+      properties:
+        queued:
+          type: boolean
+      required:
+        - queued
+    ErrorResponse:
+      type: object
+      properties:
+        error:
+          type: string
+      required:
+        - error
