@@ -22,8 +22,92 @@ from webapp import WebAppContext, serve_frontend
 
 LEFT_STEREO_SOCKET: Final = dai.CameraBoardSocket.CAM_B
 RIGHT_STEREO_SOCKET: Final = dai.CameraBoardSocket.CAM_C
+RGB_SOCKET: Final = dai.CameraBoardSocket.CAM_A
 
 OBSTACLE_LABEL: Final = "obstacle"
+YOLO_MODEL: Final = "luxonis/yolov10-nano:coco-512x288"
+COCO_LABELS: Final = [
+    "person",
+    "bicycle",
+    "car",
+    "motorcycle",
+    "airplane",
+    "bus",
+    "train",
+    "truck",
+    "boat",
+    "traffic light",
+    "fire hydrant",
+    "stop sign",
+    "parking meter",
+    "bench",
+    "bird",
+    "cat",
+    "dog",
+    "horse",
+    "sheep",
+    "cow",
+    "elephant",
+    "bear",
+    "zebra",
+    "giraffe",
+    "backpack",
+    "umbrella",
+    "handbag",
+    "tie",
+    "suitcase",
+    "frisbee",
+    "skis",
+    "snowboard",
+    "sports ball",
+    "kite",
+    "baseball bat",
+    "baseball glove",
+    "skateboard",
+    "surfboard",
+    "tennis racket",
+    "bottle",
+    "wine glass",
+    "cup",
+    "fork",
+    "knife",
+    "spoon",
+    "bowl",
+    "banana",
+    "apple",
+    "sandwich",
+    "orange",
+    "broccoli",
+    "carrot",
+    "hot dog",
+    "pizza",
+    "donut",
+    "cake",
+    "chair",
+    "couch",
+    "potted plant",
+    "bed",
+    "dining table",
+    "toilet",
+    "tv",
+    "laptop",
+    "mouse",
+    "remote",
+    "keyboard",
+    "cell phone",
+    "microwave",
+    "oven",
+    "toaster",
+    "sink",
+    "refrigerator",
+    "book",
+    "clock",
+    "vase",
+    "scissors",
+    "teddy bear",
+    "hair drier",
+    "toothbrush",
+]
 MIN_RANGE_MM: Final = 250
 OBSTACLE_DISTANCE_MM: Final = 1_000
 CAUTION_DISTANCE_MM: Final = 2_000
@@ -41,6 +125,10 @@ DEFAULT_POINT_SAMPLE_LIMIT: Final = 1_200
 DEFAULT_TTS_MIN_INTERVAL_SECONDS: Final = 4.0
 DEFAULT_TTS_STABLE_FRAMES: Final = 3
 DEFAULT_WALL_STOP_FRAMES: Final = 16
+DEFAULT_YOLO_CONFIDENCE: Final = 0.35
+OBJECT_DEPTH_PERCENTILE: Final = 50
+OBJECT_MOTION_WINDOW: Final = 6
+OBJECT_MOTION_MM_PER_SECOND: Final = 180
 
 FRONTEND_DIR: Final = Path(__file__).resolve().parent / "frontend"
 
@@ -94,6 +182,20 @@ TTS_MIN_INTERVAL_SECONDS: Final = env_float(
 )
 TTS_STABLE_FRAMES: Final = env_int("TTS_STABLE_FRAMES", DEFAULT_TTS_STABLE_FRAMES, 1, 20)
 WALL_STOP_FRAMES: Final = env_int("WALL_STOP_FRAMES", DEFAULT_WALL_STOP_FRAMES, 4, 120)
+YOLO_CONFIDENCE: Final = env_float("YOLO_CONFIDENCE", DEFAULT_YOLO_CONFIDENCE, 0.05, 0.95)
+
+
+@dataclass(frozen=True)
+class ObjectDetection:
+    """YOLO object detection enriched with aligned stereo depth."""
+
+    label: str
+    confidence: float
+    distance_mm: int | None
+    bbox: list[float]
+    center: list[float]
+    motion: str
+    lateral_position: str
 
 
 @dataclass(frozen=True)
@@ -108,6 +210,7 @@ class NavigationState:
     confidence: float
     reason: str
     sample_points: list[list[float]]
+    object_detections: list[ObjectDetection]
     timestamp: float
 
 
@@ -140,6 +243,19 @@ def describe_surroundings() -> str:
         else "an unknown distance"
     )
     path = state.recommended_path.replace("_", " ")
+    if state.object_detections:
+        described = []
+        for detection in state.object_detections[:3]:
+            distance = (
+                f"{detection.distance_mm / 1000:.1f} metres"
+                if detection.distance_mm is not None
+                else "unknown distance"
+            )
+            motion = "" if detection.motion in {"unknown", "stationary"} else f", {detection.motion.replace('_', ' ')}"
+            described.append(f"{detection.label} {detection.lateral_position} at {distance}{motion}")
+        objects = "; ".join(described)
+        return f"I see {objects}. The current recommendation is {path}."
+
     return f"Navigation view active. The current recommendation is {path}. The nearest center obstacle is about {nearest} away."
 
 
@@ -180,8 +296,58 @@ class SearchRouteAdvisor:
             confidence=state.confidence,
             reason=f"blocked ahead; turn {self._turn_direction} slowly to search for an exit route",
             sample_points=state.sample_points,
+            object_detections=state.object_detections,
             timestamp=state.timestamp,
         )
+
+
+class ObjectMotionTracker:
+    """Estimate simple relative motion from per-object distance history."""
+
+    def __init__(self, window_size: int, threshold_mm_per_second: int) -> None:
+        """Create an object motion tracker."""
+
+        self.window_size = window_size
+        self.threshold_mm_per_second = threshold_mm_per_second
+        self._history: dict[str, list[tuple[float, int]]] = {}
+
+    def update(self, detection: ObjectDetection, timestamp: float) -> ObjectDetection:
+        """Return a detection with relative motion filled from recent distance trend."""
+
+        if detection.distance_mm is None:
+            return detection
+
+        key = self._track_key(detection)
+        history = self._history.setdefault(key, [])
+        history.append((timestamp, detection.distance_mm))
+        del history[:-self.window_size]
+
+        motion = "unknown"
+        if len(history) >= 3:
+            elapsed = max(0.001, history[-1][0] - history[0][0])
+            velocity = (history[-1][1] - history[0][1]) / elapsed
+            if velocity < -self.threshold_mm_per_second:
+                motion = "approaching"
+            elif velocity > self.threshold_mm_per_second:
+                motion = "moving_away"
+            else:
+                motion = "stationary"
+
+        return ObjectDetection(
+            label=detection.label,
+            confidence=detection.confidence,
+            distance_mm=detection.distance_mm,
+            bbox=detection.bbox,
+            center=detection.center,
+            motion=motion,
+            lateral_position=detection.lateral_position,
+        )
+
+    def _track_key(self, detection: ObjectDetection) -> str:
+        """Create a coarse identity key for short-term object motion."""
+
+        x_bin = int(detection.center[0] * 4)
+        return f"{detection.label}:{x_bin}"
 
 
 def log_json(payload: dict[str, object]) -> None:
@@ -200,6 +366,7 @@ tts_notifier = TtsNotifier(
     log_json,
 )
 search_route_advisor = SearchRouteAdvisor(WALL_STOP_FRAMES)
+object_motion_tracker = ObjectMotionTracker(OBJECT_MOTION_WINDOW, OBJECT_MOTION_MM_PER_SECOND)
 
 
 def handle_shutdown_signal(_signum: int, _frame: object) -> None:
@@ -213,15 +380,18 @@ def create_pipeline() -> tuple[dai.Pipeline, dict[str, Any]]:
     """Create a DepthAI v3 stereo depth and point-cloud pipeline."""
 
     pipeline = dai.Pipeline()
+    color = pipeline.create(dai.node.Camera).build(RGB_SOCKET)
     mono_left = pipeline.create(dai.node.Camera).build(LEFT_STEREO_SOCKET)
     mono_right = pipeline.create(dai.node.Camera).build(RIGHT_STEREO_SOCKET)
     stereo = pipeline.create(dai.node.StereoDepth)
     point_cloud = pipeline.create(dai.node.PointCloud)
+    yolo = pipeline.create(dai.node.DetectionNetwork).build(color, dai.NNModelDescription(YOLO_MODEL))
 
-    mono_left.requestFullResolutionOutput().link(stereo.left)
-    mono_right.requestFullResolutionOutput().link(stereo.right)
+    mono_left.requestOutput(FRAME_SIZE, type=dai.ImgFrame.Type.GRAY8).link(stereo.left)
+    mono_right.requestOutput(FRAME_SIZE, type=dai.ImgFrame.Type.GRAY8).link(stereo.right)
 
     stereo.setDefaultProfilePreset(dai.node.StereoDepth.PresetMode.ROBOTICS)
+    stereo.setDepthAlign(RGB_SOCKET)
     stereo.setRectification(True)
     stereo.setExtendedDisparity(True)
     stereo.setLeftRightCheck(True)
@@ -233,6 +403,7 @@ def create_pipeline() -> tuple[dai.Pipeline, dict[str, Any]]:
     queues = {
         "points": point_cloud.outputPointCloud.createOutputQueue(),
         "depth": stereo.depth.createOutputQueue(),
+        "yolo": yolo.out.createOutputQueue(),
     }
     return pipeline, queues
 
@@ -323,7 +494,96 @@ def sample_points(points: np.ndarray, max_points: int = POINT_SAMPLE_LIMIT) -> l
     return sampled.tolist()
 
 
-def analyze_point_cloud(points: np.ndarray) -> NavigationState:
+def detection_label(label_index: int) -> str:
+    """Return a human label for a YOLO class id."""
+
+    if 0 <= label_index < len(COCO_LABELS):
+        return COCO_LABELS[label_index]
+    return f"class_{label_index}"
+
+
+def normalized_bbox(detection: Any) -> list[float]:
+    """Read a normalized detection bbox and clamp it to the frame."""
+
+    values = [
+        float(getattr(detection, "xmin", 0.0)),
+        float(getattr(detection, "ymin", 0.0)),
+        float(getattr(detection, "xmax", 1.0)),
+        float(getattr(detection, "ymax", 1.0)),
+    ]
+    xmin, ymin, xmax, ymax = [max(0.0, min(1.0, value)) for value in values]
+    if xmax < xmin:
+        xmin, xmax = xmax, xmin
+    if ymax < ymin:
+        ymin, ymax = ymax, ymin
+    return [xmin, ymin, xmax, ymax]
+
+
+def bbox_depth_mm(depth_frame: np.ndarray, bbox: list[float]) -> int | None:
+    """Estimate object distance from valid aligned depth pixels inside a YOLO box."""
+
+    height, width = depth_frame.shape[:2]
+    xmin, ymin, xmax, ymax = bbox
+    x1 = int(xmin * width)
+    y1 = int(ymin * height)
+    x2 = int(xmax * width)
+    y2 = int(ymax * height)
+    if x2 - x1 < 4 or y2 - y1 < 4:
+        return None
+
+    margin_x = max(1, int((x2 - x1) * 0.12))
+    margin_y = max(1, int((y2 - y1) * 0.12))
+    roi = depth_frame[y1 + margin_y : y2 - margin_y, x1 + margin_x : x2 - margin_x]
+    if roi.size == 0:
+        roi = depth_frame[y1:y2, x1:x2]
+
+    valid = roi[(roi >= MIN_RANGE_MM) & (roi <= MAX_NAVIGATION_RANGE_MM)]
+    if valid.size < 20:
+        return None
+    return int(np.percentile(valid, OBJECT_DEPTH_PERCENTILE))
+
+
+def lateral_position(center_x: float) -> str:
+    """Map a normalized object center to left, center, or right."""
+
+    if center_x < 0.4:
+        return "left"
+    if center_x > 0.6:
+        return "right"
+    return "center"
+
+
+def yolo_object_detections(yolo_message: Any | None, depth_frame: np.ndarray | None) -> list[ObjectDetection]:
+    """Convert YOLO detections into labeled objects with aligned stereo distance."""
+
+    if yolo_message is None or depth_frame is None:
+        return []
+
+    detections = []
+    now = time.time()
+    for detection in getattr(yolo_message, "detections", []):
+        confidence = float(getattr(detection, "confidence", 0.0))
+        if confidence < YOLO_CONFIDENCE:
+            continue
+
+        bbox = normalized_bbox(detection)
+        center = [round((bbox[0] + bbox[2]) / 2, 3), round((bbox[1] + bbox[3]) / 2, 3)]
+        object_detection = ObjectDetection(
+            label=detection_label(int(getattr(detection, "label", -1))),
+            confidence=round(confidence, 3),
+            distance_mm=bbox_depth_mm(depth_frame, bbox),
+            bbox=[round(value, 4) for value in bbox],
+            center=center,
+            motion="unknown",
+            lateral_position=lateral_position(center[0]),
+        )
+        detections.append(object_motion_tracker.update(object_detection, now))
+
+    detections.sort(key=lambda item: item.distance_mm if item.distance_mm is not None else MAX_NAVIGATION_RANGE_MM + 1)
+    return detections[:8]
+
+
+def analyze_point_cloud(points: np.ndarray, object_detections: list[ObjectDetection] | None = None) -> NavigationState:
     """Identify an obstacle and suggest a coarse path around it."""
 
     filtered = navigation_points(points)
@@ -337,9 +597,12 @@ def analyze_point_cloud(points: np.ndarray) -> NavigationState:
     detected = center_clearance is not None and center_clearance < OBSTACLE_DISTANCE_MM
     populated_lanes = sum(distance is not None for distance in clearance.values())
     confidence = round(populated_lanes / len(clearance), 2)
+    detected_objects = object_detections or []
+    nearest_object = next((item for item in detected_objects if item.distance_mm is not None), None)
+    label = nearest_object.label if nearest_object is not None else OBSTACLE_LABEL
 
     return NavigationState(
-        label=OBSTACLE_LABEL,
+        label=label,
         detected=detected,
         recommended_path=recommended_path,
         nearest_obstacle_mm=center_clearance,
@@ -347,6 +610,7 @@ def analyze_point_cloud(points: np.ndarray) -> NavigationState:
         confidence=confidence,
         reason=reason,
         sample_points=sample_points(filtered),
+        object_detections=detected_objects,
         timestamp=time.time(),
     )
 
@@ -382,9 +646,34 @@ def render_depth_frame(depth_frame: np.ndarray, state: NavigationState) -> bytes
     cv2.putText(frame, state.label.upper(), (18, 36), cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2)
     cv2.putText(frame, state.recommended_path, (18, 72), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
     cv2.putText(frame, state.reason, (18, height - 24), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+    draw_object_detections(cv2, frame, state.object_detections)
 
     success, encoded = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY])
     return encoded.tobytes() if success else None
+
+
+def draw_object_detections(cv2_module: Any, frame: np.ndarray, detections: list[ObjectDetection]) -> None:
+    """Draw YOLO object boxes and depth estimates on the debug frame."""
+
+    height, width = frame.shape[:2]
+    for detection in detections[:5]:
+        xmin, ymin, xmax, ymax = detection.bbox
+        x1 = int(xmin * width)
+        y1 = int(ymin * height)
+        x2 = int(xmax * width)
+        y2 = int(ymax * height)
+        box_color = (0, 220, 255) if detection.distance_mm is None else (80, 220, 80)
+        if detection.distance_mm is not None and detection.distance_mm < OBSTACLE_DISTANCE_MM:
+            box_color = (0, 0, 255)
+
+        distance = f"{detection.distance_mm / 1000:.1f}m" if detection.distance_mm is not None else "--"
+        label = f"{detection.label} {distance}"
+        if detection.motion not in {"unknown", "stationary"}:
+            label = f"{label} {detection.motion.replace('_', ' ')}"
+
+        cv2_module.rectangle(frame, (x1, y1), (x2, y2), box_color, 2)
+        label_y = max(20, y1 - 8)
+        cv2_module.putText(frame, label, (x1, label_y), cv2_module.FONT_HERSHEY_SIMPLEX, 0.48, box_color, 1)
 
 
 def draw_suggested_path(
@@ -491,12 +780,18 @@ def pipeline_worker() -> None:
             tts_notifier.notify_camera_connected()
             while pipeline.isRunning() and not _should_stop:
                 point_message = queues["points"].get()
-                state = search_route_advisor.apply(analyze_point_cloud(points_to_array(point_message)))
-
                 depth_message = queues["depth"].tryGet()
-                frame = None
+                yolo_message = queues["yolo"].tryGet()
+                depth_frame = None
                 if isinstance(depth_message, dai.ImgFrame):
-                    frame = render_depth_frame(depth_message.getFrame(), state)
+                    depth_frame = depth_message.getFrame()
+
+                objects = yolo_object_detections(yolo_message, depth_frame)
+                state = search_route_advisor.apply(analyze_point_cloud(points_to_array(point_message), objects))
+
+                frame = None
+                if depth_frame is not None:
+                    frame = render_depth_frame(depth_frame, state)
 
                 update_runtime_state(state, frame)
 

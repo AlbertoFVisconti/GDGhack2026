@@ -17,6 +17,8 @@ const els = {
   viewerFps: document.getElementById("viewerFps"),
   viewerResolution: document.getElementById("viewerResolution"),
   viewerPoints: document.getElementById("viewerPoints"),
+  objectCount: document.getElementById("objectCount"),
+  objects: document.getElementById("objects"),
   ttsCount: document.getElementById("ttsCount"),
   ttsEvents: document.getElementById("ttsEvents"),
 };
@@ -44,6 +46,7 @@ function updateStatus(data) {
   if (!data.state) {
     drawCloud([], data.thresholds);
     updateViewerStats(data.viewer, 0);
+    updateObjects([]);
     updateTtsEvents(data.tts_events || []);
     return;
   }
@@ -59,8 +62,27 @@ function updateStatus(data) {
   setLane("center", state.lane_clearance_mm.center);
   setLane("right", state.lane_clearance_mm.right);
   updateViewerStats(data.viewer, state.sample_points?.length || 0);
+  updateObjects(state.object_detections || []);
   updateTtsEvents(data.tts_events || []);
   drawCloud(state.sample_points || [], data.thresholds, state.recommended_path);
+}
+
+function updateObjects(objects) {
+  els.objectCount.textContent = String(objects.length);
+  if (!objects.length) {
+    els.objects.innerHTML = "<p>No YOLO objects yet.</p>";
+    return;
+  }
+
+  els.objects.innerHTML = objects
+    .map((object) => {
+      const distance = formatMm(object.distance_mm);
+      const motion = (object.motion || "unknown").replaceAll("_", " ");
+      const side = object.lateral_position || "unknown";
+      const confidence = Math.round((object.confidence || 0) * 100);
+      return `<div class="object-row"><strong>${object.label}</strong><span>${distance}</span><span>${side}</span><span>${motion}</span><small>${confidence}%</small></div>`;
+    })
+    .join("");
 }
 
 function updateTtsEvents(events) {

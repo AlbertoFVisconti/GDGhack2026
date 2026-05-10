@@ -133,6 +133,7 @@ body {
 .decision,
 .metric-grid > div,
 .lanes,
+.objects-panel,
 .cloud-panel,
 .tts-panel {
   background: var(--panel-2);
@@ -209,6 +210,46 @@ meter {
 
 .cloud-panel {
   padding: 14px;
+}
+
+.objects-panel {
+  padding: 14px;
+}
+
+.objects {
+  display: grid;
+  gap: 8px;
+  max-height: 150px;
+  overflow: auto;
+}
+
+.objects p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.object-row {
+  display: grid;
+  grid-template-columns: minmax(86px, 1fr) 58px 48px 70px 42px;
+  align-items: center;
+  gap: 7px;
+  padding: 9px;
+  background: #10171b;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  font-size: 12px;
+}
+
+.object-row strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.object-row span,
+.object-row small {
+  color: var(--muted);
 }
 
 .tts-panel {
