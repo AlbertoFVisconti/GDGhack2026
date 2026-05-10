@@ -8,7 +8,7 @@ Standalone navigation prototype for the Luxonis OAK 4 D Pro. The app uses stereo
 - Suggests `forward`, `forward_slow`, `go_left`, `go_right`, `stop`, or scan guidance.
 - Uses YOLO to label recognized objects when available.
 - Falls back to geometry-only warnings for unrecognized obstacles.
-- Estimates broad walls, corridor-like spaces, narrow passages, and stair-like geometry.
+- Estimates broad walls, corridor-like spaces and narrow passages.
 - Serves a local debug viewer with video, radar, lane clearances, detections, and TTS events.
 - Sends camera status and spoken guidance to the external Webapp over WebSocket.
 - Responds to scene-description requests from the Webapp.
@@ -23,22 +23,6 @@ Standalone navigation prototype for the Luxonis OAK 4 D Pro. The app uses stereo
 - `oakapp.toml` - OAK standalone app configuration.
 - `requirements.txt` - Python runtime dependencies.
 - `TECHNICAL_WRITEUP.md` - More detailed architecture and pipeline documentation.
-
-## Run Locally
-
-Install dependencies in your Python environment:
-
-```bash
-pip install -r requirements.txt
-```
-
-Run the app:
-
-```bash
-python main.py
-```
-
-The local debug viewer is served by the app. In OAK app mode, `oakctl` will usually print the forwarded frontend URL.
 
 ## Run On OAK
 
