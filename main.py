@@ -113,15 +113,17 @@ OBSTACLE_DISTANCE_MM: Final = 1_000
 CAUTION_DISTANCE_MM: Final = 2_000
 MAX_NAVIGATION_RANGE_MM: Final = 2_500
 MIN_LANE_POINTS: Final = 80
-FOV_FRACTION: Final = 0.90
+FOV_FRACTION: Final = 1.10
 LANE_ANGLE_TAN: Final = FOV_FRACTION / 6
 FOV_HALF_TAN: Final = FOV_FRACTION / 2
 VERTICAL_LIMIT_MM: Final = 1_800
-DEFAULT_FRAME_WIDTH: Final = 640
-DEFAULT_FRAME_HEIGHT: Final = 400
+DEFAULT_FRAME_WIDTH: Final = 800
+DEFAULT_FRAME_HEIGHT: Final = 500
+DEFAULT_STEREO_WIDTH: Final = 640
+DEFAULT_STEREO_HEIGHT: Final = 400
 DEFAULT_STREAM_FPS: Final = 18
 DEFAULT_JPEG_QUALITY: Final = 76
-DEFAULT_POINT_SAMPLE_LIMIT: Final = 1_200
+DEFAULT_POINT_SAMPLE_LIMIT: Final = 2_000
 DEFAULT_TTS_MIN_INTERVAL_SECONDS: Final = 8.0
 DEFAULT_TTS_STABLE_FRAMES: Final = 3
 DEFAULT_WALL_STOP_FRAMES: Final = 16
@@ -176,6 +178,10 @@ FRAME_SIZE: Final = (
     env_int("DEBUG_FRAME_WIDTH", DEFAULT_FRAME_WIDTH, 320, 1280),
     env_int("DEBUG_FRAME_HEIGHT", DEFAULT_FRAME_HEIGHT, 240, 720),
 )
+STEREO_SIZE: Final = (
+    env_int("STEREO_FRAME_WIDTH", DEFAULT_STEREO_WIDTH, 128, 1280),
+    env_int("STEREO_FRAME_HEIGHT", DEFAULT_STEREO_HEIGHT, 80, 800),
+)
 STREAM_FPS: Final = env_int("DEBUG_STREAM_FPS", DEFAULT_STREAM_FPS, 1, 30)
 JPEG_QUALITY: Final = env_int("DEBUG_JPEG_QUALITY", DEFAULT_JPEG_QUALITY, 35, 95)
 POINT_SAMPLE_LIMIT: Final = env_int("POINT_SAMPLE_LIMIT", DEFAULT_POINT_SAMPLE_LIMIT, 150, 5_000)
@@ -190,7 +196,7 @@ YOLO_CENTER_FRACTION: Final = env_float("YOLO_CENTER_FRACTION", DEFAULT_YOLO_CEN
 OBJECT_NOTIFY_COOLDOWN_SECONDS: Final = env_float(
     "OBJECT_NOTIFY_COOLDOWN_SECONDS", DEFAULT_OBJECT_NOTIFY_COOLDOWN_SECONDS, 1.0, 30.0
 )
-OBJECT_TRIGGER_RANGE_MM: Final = env_int("OBJECT_TRIGGER_RANGE_MM", MAX_NAVIGATION_RANGE_MM, 500, 10_000)
+OBJECT_TRIGGER_RANGE_MM: Final = env_int("OBJECT_TRIGGER_RANGE_MM", OBSTACLE_DISTANCE_MM, 500, 10_000)
 
 
 @dataclass(frozen=True)
@@ -416,7 +422,7 @@ class ObjectMotionTracker:
 
 
 class ObjectAnnouncementCooldown:
-    """Debounce repeated object announcements by label."""
+    """Announce objects only when they newly enter the blocking center corridor."""
 
     def __init__(self, cooldown_seconds: float, trigger_range_mm: int) -> None:
         """Create an object announcement debounce helper."""
@@ -424,20 +430,26 @@ class ObjectAnnouncementCooldown:
         self.cooldown_seconds = cooldown_seconds
         self.trigger_range_mm = trigger_range_mm
         self._last_announced_at: dict[str, float] = {}
+        self._active_blocking_labels: set[str] = set()
 
     def pending_announcements(self, detections: list[ObjectDetection]) -> list[ObjectDetection]:
-        """Return nearby detections that should be announced now."""
+        """Return newly blocking detections that should be announced now."""
 
         now = time.time()
         announcements = []
+        current_blocking_labels = set()
         for detection in detections:
             if detection.distance_mm is None or detection.distance_mm > self.trigger_range_mm:
+                continue
+            current_blocking_labels.add(detection.label)
+            if detection.label in self._active_blocking_labels:
                 continue
             last_announced_at = self._last_announced_at.get(detection.label, 0.0)
             if now - last_announced_at < self.cooldown_seconds:
                 continue
             self._last_announced_at[detection.label] = now
             announcements.append(detection)
+        self._active_blocking_labels = current_blocking_labels
         return announcements
 
 
@@ -482,8 +494,8 @@ def create_pipeline() -> tuple[dai.Pipeline, dict[str, Any]]:
     point_cloud = pipeline.create(dai.node.PointCloud)
     yolo = pipeline.create(dai.node.DetectionNetwork).build(color, dai.NNModelDescription(YOLO_MODEL))
 
-    mono_left.requestOutput(FRAME_SIZE, type=dai.ImgFrame.Type.GRAY8).link(stereo.left)
-    mono_right.requestOutput(FRAME_SIZE, type=dai.ImgFrame.Type.GRAY8).link(stereo.right)
+    mono_left.requestOutput(STEREO_SIZE, type=dai.ImgFrame.Type.GRAY8).link(stereo.left)
+    mono_right.requestOutput(STEREO_SIZE, type=dai.ImgFrame.Type.GRAY8).link(stereo.right)
 
     stereo.setDefaultProfilePreset(dai.node.StereoDepth.PresetMode.FAST_DENSITY)
     stereo.setDepthAlign(RGB_SOCKET)
@@ -938,6 +950,8 @@ def status_payload() -> dict[str, object]:
         "viewer": {
             "frame_width": FRAME_SIZE[0],
             "frame_height": FRAME_SIZE[1],
+            "stereo_width": STEREO_SIZE[0],
+            "stereo_height": STEREO_SIZE[1],
             "stream_fps": STREAM_FPS,
             "jpeg_quality": JPEG_QUALITY,
             "point_sample_limit": POINT_SAMPLE_LIMIT,
